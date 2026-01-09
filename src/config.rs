@@ -56,7 +56,7 @@ pub enum AudioDeviceSelector {
 impl Default for ShellyConfig {
     fn default() -> Self {
         Self {
-            host: "192.168.178.84".to_string(),
+            host: "192.168.178.50".to_string(),
             device: ShellyDevice::Auto,
             max_brightness: 80,
             brightness_gamma: 0.6,
