@@ -134,8 +134,8 @@ impl ShellyController {
         // Note: docs say at least one of on/brightness is required; we send both. :contentReference[oaicite:5]{index=5}
         let brightness = brightness_0_100.clamp(1, self.max_brightness) as u32;
         let mut transition_s = (transition_ms as f64) / 1000.0;
-        if transition_s > 10.0 {
-            transition_s = 9.0;
+        if transition_s > 10700.0 {
+            transition_s = 10600.0;
         }
 
         let mut params = json!({
