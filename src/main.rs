@@ -1,14 +1,16 @@
 mod config;
 mod shelly;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rustfft::{num_complex::Complex32, FftPlanner};
 use std::{
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
-use wasapi::{initialize_mta, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+use std::sync::atomic::{AtomicBool, Ordering};
+use wasapi::{initialize_mta, Device, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+use crate::config::AudioDeviceSelector;
 
 #[derive(Clone, Copy, Debug)]
 struct RgbwGain {
@@ -36,6 +38,35 @@ fn main() -> Result<()> {
 
     // ---- Shelly controller (Gen1 RGBW2 + Gen2 Plus RGBW PM) ----
     let shelly = Arc::new(shelly::ShellyController::new(&cfg.shelly)?);
+    let initial_state = match shelly.get_state() {
+        Ok(s) => {
+            eprintln!("Shelly initial state: {:?}", s);
+            Some(s)
+        }
+        Err(e) => {
+            eprintln!("Warn: could not read initial Shelly state: {e:#}");
+            None
+        }
+    };
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let running = Arc::clone(&running);
+        ctrlc::set_handler(move || {
+            running.store(false, Ordering::SeqCst);
+        })?;
+    }
+    let old_hook = std::panic::take_hook();
+    {
+        let shelly = Arc::clone(&shelly);
+        let initial_state = initial_state; // move
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(s) = initial_state {
+                let _ = shelly.restore_state(s);
+            }
+            old_hook(info);
+        }));
+    }
+    let initial_state = initial_state;
 
     // ---- FFT settings ----
     let fft_size: usize = 1024;
@@ -95,7 +126,39 @@ fn main() -> Result<()> {
         .context("initialize_mta failed (COM init; avoid calling from STA UI thread)")?;
 
     let enumerator = DeviceEnumerator::new()?;
-    let device = enumerator.get_default_device(&Direction::Render)?;
+    let audio_err: Option<anyhow::Error> = match &cfg.audio_device {
+        AudioDeviceSelector::Id { id } => {
+            if id.is_empty() {
+                eprintln!("Warn: audio device ID is empty, using default device instead.");
+                list_render_devices(&enumerator);
+                Some(anyhow!("Audio device ID must not be empty"))
+            } else {
+                None
+            }
+        }
+        AudioDeviceSelector::Name { name } => {
+            if name.is_empty() {
+                eprintln!("Warn: audio device name is empty, using default device instead.");
+                list_render_devices(&enumerator);
+                Some(anyhow!("Audio device name must not be empty"))
+            } else {
+                None
+            }
+        }
+        _ => None
+    };
+    if let Some(e) = audio_err {
+        eprintln!("{e:#}");
+        return Ok(());
+    }
+    let device = match select_render_device(&enumerator, &cfg.audio_device) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Audio device selection failed: {e:#}");
+            list_render_devices(&enumerator);
+            return Err(e);
+        }
+    };
     let mut audio_client = device.get_iaudioclient()?;
 
     // You can also do: let desired_format = audio_client.get_mixformat()?;
@@ -137,6 +200,9 @@ fn main() -> Result<()> {
     let mut treble_peak = 1e-6f32;
 
     loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
         // Wait for event-driven capture timing
         event.wait_for_event(2000)?;
 
@@ -211,13 +277,20 @@ fn main() -> Result<()> {
 
                     // Brightness from overall energy
                     let overall = ((rb + gm + bt) / 3.0).clamp(0.0, 1.0);
+
+                    let hue = bands_to_hue(rb, gm, bt);
+
+                    let value = (0.15 + 0.85 * overall).clamp(0.0, 1.0);
+
+                    let (r, g, b) = hue_to_two_channel_rgb(hue, value);
+
                     let gain_f = gain_min + overall * (gain_max - gain_min);
                     let gain = gain_f.round().clamp(gain_min, gain_max) as u8;
 
                     let out = RgbwGain {
-                        r: (rb * 255.0) as u8,
-                        g: (gm * 255.0) as u8,
-                        b: (bt * 255.0) as u8,
+                        r,
+                        g,
+                        b,
                         w: 0,
                         gain,
                         transition_ms,
@@ -228,6 +301,14 @@ fn main() -> Result<()> {
             }
         }
     }
+
+    if let Some(s) = initial_state {
+        eprintln!("Restoring Shelly state...");
+        if let Err(e) = shelly.restore_state(s) {
+            eprintln!("Restore failed: {e:#}");
+        }
+    }
+    Ok(())
 }
 
 // Minimal cast helper (you can swap this for the bytemuck crate if you want)
@@ -238,4 +319,74 @@ mod bytemuck {
         let new_len = byte_len / std::mem::size_of::<U>();
         unsafe { std::slice::from_raw_parts(byte_ptr, new_len) }
     }
+}
+fn list_render_devices(enumerator: &DeviceEnumerator) {
+    if let Ok(coll) = enumerator.get_device_collection(&Direction::Render) {
+        eprintln!("--- Render devices (Output) ---");
+        for dev_res in &coll {
+            if let Ok(dev) = dev_res {
+                let name = dev.get_friendlyname().unwrap_or_else(|_| "<no name>".to_string());
+                let id = dev.get_id().unwrap_or_else(|_| "<no id>".to_string());
+                eprintln!("  - {name}\n    id: {id}");
+            }
+        }
+    }
+}
+
+fn select_render_device(enumerator: &DeviceEnumerator, sel: &AudioDeviceSelector) -> Result<Device> {
+    match sel {
+        AudioDeviceSelector::Default => Ok(enumerator.get_default_device(&Direction::Render)?),
+
+        AudioDeviceSelector::Id { id } => Ok(enumerator.get_device(id)?),
+
+        AudioDeviceSelector::Name { name } => {
+            let coll = enumerator.get_device_collection(&Direction::Render)?;
+
+            // 1) erst versuchen: contains-match (praktischer als exact)
+            for dev_res in &coll {
+                let dev = dev_res?;
+                let fname = dev.get_friendlyname().unwrap_or_default();
+                if fname.to_lowercase().contains(&name.to_lowercase()) {
+                    return Ok(dev);
+                }
+            }
+
+            // 2) falls du lieber exact willst: coll.get_device_with_name(name)
+            // (kann je nach Implementierung exact match erwarten)
+            // return Ok(coll.get_device_with_name(name)?);
+
+            anyhow::bail!("Audio device not found by name: {name}");
+        }
+    }
+}
+
+fn hue_to_two_channel_rgb(hue_deg: f32, value: f32) -> (u8, u8, u8) {
+    let hue = hue_deg.rem_euclid(360.0);
+    let v = value.clamp(0.0, 1.0);
+
+    let (r, g, b) = if hue < 120.0 {
+        let t = hue / 120.0;          // 0..1
+        (1.0, t, 0.0)                 // R->RG
+    } else if hue < 240.0 {
+        let t = (hue - 120.0) / 120.0;
+        (0.0, 1.0, t)                 // G->GB
+    } else {
+        let t = (hue - 240.0) / 120.0;
+        (t, 0.0, 1.0)                 // B->BR
+    };
+
+    let rr = (r * v * 255.0).round() as u8;
+    let gg = (g * v * 255.0).round() as u8;
+    let bb = (b * v * 255.0).round() as u8;
+    (rr, gg, bb)
+}
+
+// Hue aus (rb, gm, bt) "smooth" ableiten (kein harter switch)
+fn bands_to_hue(rb: f32, gm: f32, bt: f32) -> f32 {
+    // 2D-Projektion der 3 Anteile -> Winkel
+    let x = rb - 0.5 * (gm + bt);
+    let y = (3.0_f32.sqrt() / 2.0) * (gm - bt);
+    let mut hue = y.atan2(x) * 180.0 / std::f32::consts::PI;
+    if hue < 0.0 { hue += 360.0; }
+    hue
 }

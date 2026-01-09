@@ -22,6 +22,16 @@ pub struct ShellyController {
     max_brightness: u8,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ShellyRgbwState {
+    pub on: bool,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub w: u8,
+    pub brightness: u8, // 0..100 (Gen1 gain / Gen2 brightness)
+}
+
 impl ShellyController {
     pub fn new(cfg: &ShellyConfig) -> Result<Self> {
         let http = Client::builder()
@@ -46,6 +56,21 @@ impl ShellyController {
             max_brightness: cfg.max_brightness,
         })
     }
+
+    pub fn get_state(&self) -> Result<ShellyRgbwState> {
+        match self.api {
+            ApiGen::Gen1 => self.get_state_gen1(),
+            ApiGen::Gen2 => self.get_state_gen2(),
+        }
+    }
+
+    pub fn restore_state(&self, s: ShellyRgbwState) -> Result<()> {
+        match self.api {
+            ApiGen::Gen1 => self.restore_state_gen1(s),
+            ApiGen::Gen2 => self.restore_state_gen2(s),
+        }
+    }
+
 
     /// Set RGBW color.
     /// - r,g,b,w are 0..255
@@ -204,6 +229,81 @@ impl ShellyController {
         }
 
         Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    }
+
+    fn get_state_gen1(&self) -> Result<ShellyRgbwState> {
+        // Gen1 liefert aktuellen Status per GET /color/0 (ison/red/green/blue/white/gain) :contentReference[oaicite:2]{index=2}
+        let url = format!("{}/color/0", self.base);
+        let mut req = self.http.get(url);
+
+        if let Some(a) = &self.auth {
+            req = req.basic_auth(a.username.clone(), Some(a.password.clone()));
+        }
+
+        let v: serde_json::Value = req.send()?.error_for_status()?.json()?;
+
+        Ok(ShellyRgbwState {
+            on: v.get("ison").and_then(|x| x.as_bool()).unwrap_or(false),
+            r: v.get("red").and_then(|x| x.as_u64()).unwrap_or(0) as u8,
+            g: v.get("green").and_then(|x| x.as_u64()).unwrap_or(0) as u8,
+            b: v.get("blue").and_then(|x| x.as_u64()).unwrap_or(0) as u8,
+            w: v.get("white").and_then(|x| x.as_u64()).unwrap_or(0) as u8,
+            brightness: v.get("gain").and_then(|x| x.as_u64()).unwrap_or(0).min(100) as u8,
+        })
+    }
+
+    fn restore_state_gen1(&self, s: ShellyRgbwState) -> Result<()> {
+        let turn = if s.on { "on" } else { "off" };
+        let url = format!(
+            "{}/color/0?turn={}&red={}&green={}&blue={}&white={}&gain={}&transition=0",
+            self.base, turn, s.r, s.g, s.b, s.w, s.brightness
+        );
+
+        let mut req = self.http.get(url);
+        if let Some(a) = &self.auth {
+            req = req.basic_auth(a.username.clone(), Some(a.password.clone()));
+        }
+
+        req.send()?.error_for_status()?;
+        Ok(())
+    }
+    fn get_state_gen2(&self) -> Result<ShellyRgbwState> {
+        // RGBW.GetStatus liefert output/rgb/brightness/white :contentReference[oaicite:5]{index=5}
+        let result = self.rpc_call("RGBW.GetStatus", serde_json::json!({ "id": self.rgbw_id }))?;
+
+        let rgb = result
+            .get("rgb")
+            .and_then(|x| x.as_array())
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|v| v.as_u64().unwrap_or(0) as u8)
+            .collect::<Vec<u8>>();
+
+        Ok(ShellyRgbwState {
+            on: result.get("output").and_then(|x| x.as_bool()).unwrap_or(false),
+            r: *rgb.get(0).unwrap_or(&0),
+            g: *rgb.get(1).unwrap_or(&0),
+            b: *rgb.get(2).unwrap_or(&0),
+            w: result.get("white").and_then(|x| x.as_u64()).unwrap_or(0).min(255) as u8,
+            brightness: result
+                .get("brightness")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0)
+                .min(100) as u8,
+        })
+    }
+
+    fn restore_state_gen2(&self, s: ShellyRgbwState) -> Result<()> {
+        let params = serde_json::json!({
+            "id": self.rgbw_id,
+            "on": s.on,
+            "brightness": (s.brightness.max(1).min(100)) as u32,
+            "rgb": [s.r, s.g, s.b],
+            "white": s.w
+        });
+
+        let _ = self.rpc_call("RGBW.Set", params)?;
+        Ok(())
     }
 }
 
