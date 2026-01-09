@@ -181,7 +181,7 @@ fn main() -> Result<()> {
                 break;
             }
 
-            let floats: &[f32] = bytemuck::cast_slice(&raw);
+            let floats: &[f32] = cast_slice(&raw);
             for frame in floats.chunks_exact(channels) {
                 let mono = if frame.len() == 1 {
                     frame[0]
@@ -254,15 +254,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// Minimal cast helper (you can swap this for the bytemuck crate if you want)
-mod bytemuck {
-    pub fn cast_slice<T: Copy, U: Copy>(data: &[T]) -> &[U] {
-        let byte_ptr = data.as_ptr() as *const U;
-        let byte_len = size_of_val(data);
-        let new_len = byte_len / size_of::<U>();
-        unsafe { std::slice::from_raw_parts(byte_ptr, new_len) }
-    }
+
+fn cast_slice<T: Copy, U: Copy>(data: &[T]) -> &[U] {
+    let byte_ptr = data.as_ptr() as *const U;
+    let byte_len = size_of_val(data);
+    let new_len = byte_len / size_of::<U>();
+    unsafe { std::slice::from_raw_parts(byte_ptr, new_len) }
 }
+
 fn list_render_devices(enumerator: &DeviceEnumerator) {
     if let Ok(coll) = enumerator.get_device_collection(&Direction::Render) {
         eprintln!("--- Render devices (Output) ---");
