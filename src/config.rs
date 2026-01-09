@@ -25,10 +25,14 @@ pub struct ShellyConfig {
     /// e.g. "192.168.1.50" or "http://192.168.1.50"
     pub host: String,
 
-    /// "auto" tries to detect Gen1 vs Gen2 via `/shelly`
+    /// "auto" tries to detect Gen1 vs. Gen2 via `/shelly`
     pub device: ShellyDevice,
     
     pub max_brightness: u8,
+
+    /// Gamma < 1 → hebt leise Stellen an, macht Range "gefühlt" größer.
+    /// Gamma > 1 → macht leise Stellen dunkler, Peaks stärker
+    pub brightness_gamma: f32,
 
     /// Gen2 RGBW component id (usually 0). Used for Shelly Plus RGBW PM in rgbw profile.
     pub rgbw_id: u8,
@@ -55,6 +59,7 @@ impl Default for ShellyConfig {
             host: "192.168.178.84".to_string(),
             device: ShellyDevice::Auto,
             max_brightness: 80,
+            brightness_gamma: 0.8,
             rgbw_id: 0,
             auth: None,
         }

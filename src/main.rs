@@ -33,9 +33,10 @@ fn main() -> Result<()> {
     let transition_ms: u16 = cfg.change_interval_ms.min(u16::MAX as u64) as u16;
 
     // Brightness clamp range (keep some minimum so it doesn't go fully dark)
-    let gain_min: f32 = 10.0;
+    let gain_min: f32 = 1.0;
     let gain_max: f32 = cfg.shelly.max_brightness.clamp(1, 100) as f32;
     let gain_min: f32 = gain_min.min(gain_max);
+    let gain_gamma: f32 = cfg.shelly.brightness_gamma.clamp(0.0, 100.0);
 
     // ---- Shelly controller (Gen1 RGBW2 + Gen2 Plus RGBW PM) ----
     let shelly = Arc::new(shelly::ShellyController::new(&cfg.shelly)?);
@@ -285,8 +286,9 @@ fn main() -> Result<()> {
 
                     let (r, g, b) = hue_to_two_channel_rgb(hue, value);
 
-                    let gain_f = gain_min + overall * (gain_max - gain_min);
-                    let gain = gain_f.round().clamp(gain_min, gain_max) as u8;
+                    let shaped = overall.powf(gain_gamma);
+                    let mut gain = (gain_min + shaped * (gain_max - gain_min)).round() as u8;
+                    if gain == 0 { gain = 1; } // sicher für Gen2
 
                     let out = RgbwGain {
                         r,
