@@ -18,21 +18,16 @@ struct RgbwGain {
     g: u8,
     b: u8,
     w: u8,
-    gain: u8, // 0..=100  (brightness)
+    gain: u8,
     transition_ms: u16,
 }
 
 fn main() -> Result<()> {
-    // ---- Config ----
     let cfg = config::load_or_create("config.json")?;
 
-    // Throttle / smooth interval from config
     let min_send_interval = Duration::from_millis(cfg.change_interval_ms);
-
-    // Use the same value for Shelly transition by default (cap to u16)
     let transition_ms: u16 = cfg.change_interval_ms.min(u16::MAX as u64) as u16;
 
-    // Brightness clamp range (keep some minimum so it doesn't go fully dark)
     let gain_min: f32 = 1.0;
     let gain_max: f32 = cfg.shelly.max_brightness.clamp(1, 100) as f32;
     let gain_min: f32 = gain_min.min(gain_max);
@@ -50,12 +45,9 @@ fn main() -> Result<()> {
             None
         }
     };
-    let running = Arc::new(AtomicBool::new(true));
-    {
+    let running = Arc::new(AtomicBool::new(true));{
         let running = Arc::clone(&running);
-        ctrlc::set_handler(move || {
-            running.store(false, Ordering::SeqCst);
-        })?;
+        ctrlc::set_handler(move || { running.store(false, Ordering::SeqCst); })?;
     }
     let old_hook = std::panic::take_hook();
     {
@@ -70,11 +62,9 @@ fn main() -> Result<()> {
     }
     let initial_state = initial_state;
 
-    // ---- FFT settings ----
     let fft_size: usize = 1024;
     let max_sample_rate_assumption: u32 = 48_000;
 
-    // ---- Thread: Shelly sender ----
     let (tx, rx) = mpsc::channel::<RgbwGain>();
     let _sender_thread = {
         let shelly = Arc::clone(&shelly);
@@ -90,28 +80,17 @@ fn main() -> Result<()> {
             };
 
             while let Ok(mut v) = rx.recv() {
-                // Drain queue to keep only latest value
                 while let Ok(newer) = rx.try_recv() {
                     v = newer;
                 }
-
-                // Throttle
                 if last_sent.elapsed() < min_send_interval {
                     continue;
                 }
-
-                // De-dupe to reduce traffic
-                let changed = (v.r as i16 - last.r as i16).abs() > 3
-                    || (v.g as i16 - last.g as i16).abs() > 3
-                    || (v.b as i16 - last.b as i16).abs() > 3
-                    || (v.gain as i16 - last.gain as i16).abs() > 2;
-
+                let changed = (v.r as i16 - last.r as i16).abs() > 3 || (v.g as i16 - last.g as i16).abs() > 3 || (v.b as i16 - last.b as i16).abs() > 3 || (v.gain as i16 - last.gain as i16).abs() > 2;
                 if !changed {
                     continue;
                 }
-
                 v.transition_ms = transition_ms;
-
                 if let Err(e) = shelly.set_rgbw(v.r, v.g, v.b, v.w, v.gain, v.transition_ms as u32) {
                     eprintln!("Shelly send error: {e:#}");
                 } else {
@@ -122,10 +101,7 @@ fn main() -> Result<()> {
         })
     };
 
-    // ---- Audio capture (loopback) ----
-    initialize_mta()
-        .ok()
-        .context("initialize_mta failed (COM init; avoid calling from STA UI thread)")?;
+    initialize_mta().ok().context("initialize_mta failed (COM init; avoid calling from STA UI thread)")?;
 
     let enumerator = DeviceEnumerator::new()?;
     let audio_err: Option<anyhow::Error> = match &cfg.audio_device {
@@ -163,23 +139,11 @@ fn main() -> Result<()> {
     };
     let mut audio_client = device.get_iaudioclient()?;
 
-    // You can also do: let desired_format = audio_client.get_mixformat()?;
-    // Keeping your original "force float stereo" approach:
-    let desired_format = WaveFormat::new(
-        32,
-        32,
-        &SampleType::Float,
-        max_sample_rate_assumption as usize,
-        2,
-        None,
-    );
+    let desired_format = WaveFormat::new(32, 32, &SampleType::Float, max_sample_rate_assumption as usize, 2, None, );
 
     let buffer_duration_hns = 200_000; // 20ms in 100ns units
     let autoconvert = true;
-    let mode = StreamMode::EventsShared {
-        autoconvert,
-        buffer_duration_hns,
-    };
+    let mode = StreamMode::EventsShared { autoconvert, buffer_duration_hns };
 
     audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
     let capture = audio_client.get_audiocaptureclient()?;
@@ -191,12 +155,11 @@ fn main() -> Result<()> {
     let fft = planner.plan_fft_forward(fft_size);
 
     let channels = desired_format.get_nchannels() as usize;
-    let bytes_per_frame = channels * std::mem::size_of::<f32>();
+    let bytes_per_frame = channels * size_of::<f32>();
 
     let mut mono_ring: Vec<f32> = Vec::with_capacity(fft_size);
     let mut fft_buf: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); fft_size];
 
-    // Running normalization
     let mut bass_peak = 1e-6f32;
     let mut mid_peak = 1e-6f32;
     let mut treble_peak = 1e-6f32;
@@ -205,7 +168,6 @@ fn main() -> Result<()> {
         if !running.load(Ordering::SeqCst) {
             break;
         }
-        // Wait for event-driven capture timing
         event.wait_for_event(2000)?;
 
         while let Some(frames) = capture.get_next_packet_size()? {
@@ -219,9 +181,7 @@ fn main() -> Result<()> {
                 break;
             }
 
-            // Interleaved f32 audio
             let floats: &[f32] = bytemuck::cast_slice(&raw);
-
             for frame in floats.chunks_exact(channels) {
                 let mono = if frame.len() == 1 {
                     frame[0]
@@ -230,18 +190,12 @@ fn main() -> Result<()> {
                 };
 
                 mono_ring.push(mono);
-
                 if mono_ring.len() >= fft_size {
-                    // Hann window
                     for i in 0..fft_size {
-                        let w = 0.5
-                            - 0.5
-                            * ((2.0 * std::f32::consts::PI * i as f32) / (fft_size as f32))
-                            .cos();
+                        let w = 0.5 - 0.5 * ((2.0 * std::f32::consts::PI * i as f32) / (fft_size as f32)).cos();
                         fft_buf[i] = Complex32::new(mono_ring[i] * w, 0.0);
                     }
                     mono_ring.clear();
-
                     fft.process(&mut fft_buf);
 
                     let sr = desired_format.get_samplespersec().max(1) as f32;
@@ -263,12 +217,10 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    // Compression
                     bass = (bass + 1.0).ln();
                     mid = (mid + 1.0).ln();
                     treble = (treble + 1.0).ln();
 
-                    // Peaks with slow decay
                     bass_peak = bass_peak.max(bass) * 0.995;
                     mid_peak = mid_peak.max(mid) * 0.995;
                     treble_peak = treble_peak.max(treble) * 0.995;
@@ -279,26 +231,14 @@ fn main() -> Result<()> {
 
                     // Brightness from overall energy
                     let overall = ((rb + gm + bt) / 3.0).clamp(0.0, 1.0);
-
                     let hue = bands_to_hue(rb, gm, bt);
-
                     let value = (0.15 + 0.85 * overall).clamp(0.0, 1.0);
-
                     let (r, g, b) = hue_to_two_channel_rgb(hue, value);
-
                     let shaped = overall.powf(gain_gamma);
                     let mut gain = (gain_min + shaped * (gain_max - gain_min)).round() as u8;
-                    if gain == 0 { gain = 1; } // sicher für Gen2
+                    if gain == 0 { gain = 1; }
 
-                    let out = RgbwGain {
-                        r,
-                        g,
-                        b,
-                        w: 0,
-                        gain,
-                        transition_ms,
-                    };
-
+                    let out = RgbwGain { r, g, b, w: 0, gain, transition_ms, };
                     let _ = tx.send(out);
                 }
             }
@@ -318,8 +258,8 @@ fn main() -> Result<()> {
 mod bytemuck {
     pub fn cast_slice<T: Copy, U: Copy>(data: &[T]) -> &[U] {
         let byte_ptr = data.as_ptr() as *const U;
-        let byte_len = std::mem::size_of_val(data);
-        let new_len = byte_len / std::mem::size_of::<U>();
+        let byte_len = size_of_val(data);
+        let new_len = byte_len / size_of::<U>();
         unsafe { std::slice::from_raw_parts(byte_ptr, new_len) }
     }
 }
@@ -344,8 +284,6 @@ fn select_render_device(enumerator: &DeviceEnumerator, sel: &AudioDeviceSelector
 
         AudioDeviceSelector::Name { name } => {
             let coll = enumerator.get_device_collection(&Direction::Render)?;
-
-            // 1) erst versuchen: contains-match (praktischer als exact)
             for dev_res in &coll {
                 let dev = dev_res?;
                 let fname = dev.get_friendlyname().unwrap_or_default();
@@ -353,11 +291,6 @@ fn select_render_device(enumerator: &DeviceEnumerator, sel: &AudioDeviceSelector
                     return Ok(dev);
                 }
             }
-
-            // 2) falls du lieber exact willst: coll.get_device_with_name(name)
-            // (kann je nach Implementierung exact match erwarten)
-            // return Ok(coll.get_device_with_name(name)?);
-
             anyhow::bail!("Audio device not found by name: {name}");
         }
     }
@@ -368,7 +301,7 @@ fn hue_to_two_channel_rgb(hue_deg: f32, value: f32) -> (u8, u8, u8) {
     let v = value.clamp(0.0, 1.0);
 
     let (r, g, b) = if hue < 120.0 {
-        let t = hue / 120.0;          // 0..1
+        let t = hue / 120.0;
         (1.0, t, 0.0)                 // R->RG
     } else if hue < 240.0 {
         let t = (hue - 120.0) / 120.0;
@@ -384,12 +317,8 @@ fn hue_to_two_channel_rgb(hue_deg: f32, value: f32) -> (u8, u8, u8) {
     (rr, gg, bb)
 }
 
-// Hue aus (rb, gm, bt) "smooth" ableiten (kein harter switch)
 fn bands_to_hue(rb: f32, gm: f32, bt: f32) -> f32 {
-    // 2D-Projektion der 3 Anteile -> Winkel
-    let x = rb - 0.5 * (gm + bt);
-    let y = (3.0_f32.sqrt() / 2.0) * (gm - bt);
-    let mut hue = y.atan2(x) * 180.0 / std::f32::consts::PI;
+    let mut hue = ((3.0_f32.sqrt() / 2.0) * (gm - bt)).atan2(rb - 0.5 * (gm + bt)) * 180.0 / std::f32::consts::PI;
     if hue < 0.0 { hue += 360.0; }
     hue
 }

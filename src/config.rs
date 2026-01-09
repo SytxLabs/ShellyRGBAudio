@@ -92,7 +92,7 @@ fn merge_defaults(user: &mut Value, defaults: &Value) {
                 }
             }
         }
-        _ => {} // user gewinnt für Nicht-Objects
+        _ => {}
     }
 }
 
@@ -117,7 +117,6 @@ pub fn load_or_create(path: &str) -> Result<AppConfig> {
         }
     };
 
-    // Wenn user kein Object ist, ersetzen wir durch defaults
     let mut merged = if parsed_user.is_object() {
         parsed_user
     } else {
@@ -125,10 +124,8 @@ pub fn load_or_create(path: &str) -> Result<AppConfig> {
         defaults_val.clone()
     };
 
-    // Defaults auffüllen
     merge_defaults(&mut merged, &defaults_val);
 
-    // Versuchen zu deserialisieren
     let cfg: AppConfig = match serde_json::from_value(merged.clone()) {
         Ok(c) => c,
         Err(e) => {
@@ -137,10 +134,7 @@ pub fn load_or_create(path: &str) -> Result<AppConfig> {
             return Ok(defaults_cfg);
         }
     };
-
-    // Datei zurückschreiben (damit fehlende Felder sichtbar ergänzt werden)
     write_pretty(path, &merged)?;
-
     Ok(cfg)
 }
 
