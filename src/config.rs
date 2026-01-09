@@ -59,7 +59,7 @@ impl Default for ShellyConfig {
             host: "192.168.178.84".to_string(),
             device: ShellyDevice::Auto,
             max_brightness: 80,
-            brightness_gamma: 0.8,
+            brightness_gamma: 0.6,
             rgbw_id: 0,
             auth: None,
         }
