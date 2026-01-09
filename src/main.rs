@@ -34,7 +34,8 @@ fn main() -> Result<()> {
 
     // Brightness clamp range (keep some minimum so it doesn't go fully dark)
     let gain_min: f32 = 10.0;
-    let gain_max: f32 = 100.0;
+    let gain_max: f32 = cfg.shelly.max_brightness.clamp(1, 100) as f32;
+    let gain_min: f32 = gain_min.min(gain_max);
 
     // ---- Shelly controller (Gen1 RGBW2 + Gen2 Plus RGBW PM) ----
     let shelly = Arc::new(shelly::ShellyController::new(&cfg.shelly)?);
