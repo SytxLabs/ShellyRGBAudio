@@ -1,16 +1,16 @@
 mod config;
 mod shelly;
 
+use crate::config::AudioDeviceSelector;
 use anyhow::{anyhow, Context, Result};
 use rustfft::{num_complex::Complex32, FftPlanner};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
-use std::sync::atomic::{AtomicBool, Ordering};
-use wasapi::{initialize_mta, Device, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
-use crate::config::AudioDeviceSelector;
+use wasapi::{initialize_mta, Device, DeviceEnumerator, Direction, StreamMode};
 
 #[derive(Clone, Copy, Debug)]
 struct RgbwGain {
@@ -65,7 +65,6 @@ fn main() -> Result<()> {
     }
 
     let fft_size: usize = 1024;
-    let max_sample_rate_assumption: u32 = 48_000;
 
     let (tx, rx) = mpsc::channel::<RgbwGain>();
     let _sender_thread = {
@@ -144,8 +143,7 @@ fn main() -> Result<()> {
         }
     };
     let mut audio_client = device.get_iaudioclient()?;
-
-    let desired_format = WaveFormat::new(32, 32, &SampleType::Float, max_sample_rate_assumption as usize, 2, None, );
+    let desired_format = audio_client.get_mixformat()?;
 
     let buffer_duration_hns = 200_000; // 20ms in 100ns units
     let autoconvert = true;
@@ -174,7 +172,12 @@ fn main() -> Result<()> {
         if !running.load(Ordering::SeqCst) {
             break;
         }
-        event.wait_for_event(2000)?;
+        if let Err(e) = event.wait_for_event(2000) {
+            if !e.to_string().to_lowercase().contains("timed out") {
+                eprintln!("Audio wait error (ignored): {e}");
+            }
+            continue;
+        }
 
         while let Some(frames) = capture.get_next_packet_size()? {
             if frames == 0 {
@@ -189,11 +192,7 @@ fn main() -> Result<()> {
 
             let floats: &[f32] = cast_slice(&raw);
             for frame in floats.chunks_exact(channels) {
-                let mono = if frame.len() == 1 {
-                    frame[0]
-                } else {
-                    (frame[0] + frame[1]) * 0.5
-                };
+                let mono = if frame.len() == 1 { frame[0] } else { (frame[0] + frame[1]) * 0.5 };
 
                 mono_ring.push(mono);
                 if mono_ring.len() >= fft_size {
