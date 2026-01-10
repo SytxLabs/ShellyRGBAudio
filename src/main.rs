@@ -89,13 +89,13 @@ fn main() -> Result<()> {
                 if !changed { continue; }
                 v.transition_ms = transition_ms;
                 for (i, sh) in shellys.iter().enumerate() {
-                    let minb = per_min.get(i).copied().unwrap_or(0) as f32;
-                    let maxb = per_max.get(i).copied().unwrap_or(100) as f32;
+                    let min_b = per_min.get(i).copied().unwrap_or(0) as f32;
+                    let max_b = per_max.get(i).copied().unwrap_or(100) as f32;
                     let gamma = per_gamma.get(i).copied().unwrap_or(1.0).clamp(0.1, 5.0);
-                    let (minb, maxb) = if minb > maxb { (maxb, minb) } else { (minb, maxb) };
+                    let (min_b, max_b) = if min_b > max_b { (max_b, min_b) } else { (min_b, max_b) };
 
                     let shaped = v.overall.clamp(0.0, 1.0).powf(gamma);
-                    let mut brightness = (minb + shaped * (maxb - minb)).round() as u8;
+                    let mut brightness = (min_b + shaped * (max_b - min_b)).round() as u8;
                     if brightness == 0 { brightness = 1; }
                     if let Err(e) = sh.set_rgbw(v.r, v.g, v.b, v.w, brightness, v.transition_ms as u32) {
                         eprintln!("Shelly[{i}] send error: {e:#}");
@@ -286,8 +286,8 @@ fn select_render_device(enumerator: &DeviceEnumerator, sel: &AudioDeviceSelector
             let coll = enumerator.get_device_collection(&Direction::Render)?;
             for dev_res in &coll {
                 let dev = dev_res?;
-                let fname = dev.get_friendlyname().unwrap_or_default();
-                if fname.to_lowercase().contains(&name.to_lowercase()) {
+                let f_name = dev.get_friendlyname().unwrap_or_default();
+                if f_name.to_lowercase().contains(&name.to_lowercase()) {
                     return Ok(dev);
                 }
             }

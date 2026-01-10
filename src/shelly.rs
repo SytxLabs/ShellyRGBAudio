@@ -235,8 +235,7 @@ impl ShellyController {
         Ok(())
     }
     fn get_state_gen2(&self) -> Result<ShellyRgbwState> {
-        // RGBW.GetStatus liefert output/rgb/brightness/white :contentReference[oaicite:5]{index=5}
-        let result = self.rpc_call("RGBW.GetStatus", serde_json::json!({ "id": self.rgbw_id }))?;
+        let result = self.rpc_call("RGBW.GetStatus", json!({ "id": self.rgbw_id }))?;
 
         let rgb = result
             .get("rgb")
@@ -261,10 +260,10 @@ impl ShellyController {
     }
 
     fn restore_state_gen2(&self, s: ShellyRgbwState) -> Result<()> {
-        let params = serde_json::json!({
+        let params = json!({
             "id": self.rgbw_id,
             "on": s.on,
-            "brightness": (s.brightness.max(1).min(100)) as u32,
+            "brightness": s.brightness.max(1).min(100) as u32,
             "rgb": [s.r, s.g, s.b],
             "white": s.w
         });
