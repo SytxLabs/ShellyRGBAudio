@@ -1,7 +1,16 @@
 [package]
-name = "ShellyToMusic"
+name = "ShellyRGBAudio"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+authors = ["SytxLabs"]
+description = "A program that converts music played on Shelly devices into audio output using WASAPI."
+license = "MIT"
+repository = "https://github.com/SytxLabs/ShellyRGBAudio"
+homepage = "https://sytxlabs.eu"
+categories = ["audio", "multimedia", "wasapi", "shelly", "rgb"]
+keywords = ["audio", "wasapi", "shelly", "rgb", "led"]
+build = "build.rs"
+readme = "README.md"
 
 [dependencies]
 wasapi = "0.22"
@@ -12,3 +21,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 digest_auth = "0.3"
 ctrlc = "3"
+
+[build-dependencies]
+winres = "0.1"
