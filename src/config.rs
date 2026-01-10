@@ -8,6 +8,10 @@ pub struct AppConfig {
     pub change_interval_ms: u64,
     pub audio_device: AudioDeviceSelector,
     pub shellys: Vec<ShellyConfig>,
+    pub transition_min_ms: u64,
+    pub transition_max_ms: u64,
+    pub beat_threshold: f32,
+    pub strobe_ms: u64,
 }
 
 impl Default for AppConfig {
@@ -16,6 +20,10 @@ impl Default for AppConfig {
             change_interval_ms: 120,
             audio_device: AudioDeviceSelector::Default,
             shellys: vec![ShellyConfig::default()],
+            transition_min_ms: 60,
+            transition_max_ms: 600,
+            beat_threshold: 0.18,
+            strobe_ms: 40,
         }
     }
 }

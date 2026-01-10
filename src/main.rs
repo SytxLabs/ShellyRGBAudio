@@ -20,13 +20,15 @@ struct RgbwGain {
     w: u8,
     overall: f32,
     transition_ms: u16,
+    force: bool,
 }
 
 fn main() -> Result<()> {
     let cfg = config::load_or_create("config.json")?;
 
     let min_send_interval = Duration::from_millis(cfg.change_interval_ms);
-    let transition_ms: u16 = cfg.change_interval_ms.min(u16::MAX as u64) as u16;
+    let transition_min = cfg.transition_min_ms as f32;
+    let transition_max = cfg.transition_max_ms as f32;
 
     let shellys: Vec<Arc<shelly::ShellyController>> = cfg
         .shellys
@@ -35,13 +37,8 @@ fn main() -> Result<()> {
         .collect::<Result<_>>()?;
 
     let shellys = Arc::new(shellys);
-
-    // initial states pro device
     let initial_states: Vec<Option<shelly::ShellyRgbwState>> = shellys.iter().map(|s| s.get_state().ok()).collect();
-
     let initial_states = Arc::new(initial_states);
-
-    // ---- Shelly controller (Gen1 RGBW2 + Gen2 Plus RGBW PM) ----
 
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -64,6 +61,9 @@ fn main() -> Result<()> {
         }));
     }
 
+    let mut dimmed_due_to_silence = false;
+    let mut last_color: (u8, u8, u8, u8) = (255, 0, 0, 0);
+
     let fft_size: usize = 1024;
 
     let (tx, rx) = mpsc::channel::<RgbwGain>();
@@ -75,7 +75,7 @@ fn main() -> Result<()> {
 
         thread::spawn(move || {
             let mut last_sent = Instant::now() - min_send_interval;
-            let mut last = RgbwGain { r: 0, g: 0, b: 0, w: 0, overall: 0.0, transition_ms };
+            let mut last = RgbwGain { r: 0, g: 0, b: 0, w: 0, overall: 0.0, transition_ms: 0, force: false};
 
             while let Ok(mut v) = rx.recv() {
                 while let Ok(newer) = rx.try_recv() {
@@ -85,8 +85,7 @@ fn main() -> Result<()> {
                     continue;
                 }
                 let changed = (v.r as i16 - last.r as i16).abs() > 3 || (v.g as i16 - last.g as i16).abs() > 3 || (v.b as i16 - last.b as i16).abs() > 3 || (v.overall - last.overall).abs() > 0.02;
-                if !changed { continue; }
-                v.transition_ms = transition_ms;
+                if !changed && !v.force { continue; }
                 for (i, sh) in shellys.iter().enumerate() {
                     let min_b = per_min.get(i).copied().unwrap_or(0) as f32;
                     let max_b = per_max.get(i).copied().unwrap_or(100) as f32;
@@ -168,13 +167,31 @@ fn main() -> Result<()> {
     let mut mid_peak = 1e-6f32;
     let mut treble_peak = 1e-6f32;
 
+    let mut overall_ema: f32 = 0.0;
+    let mut flux_ema: f32 = 0.0;
+
+    let mut prev_bass: f32 = 0.0;
+    let mut prev_mid: f32 = 0.0;
+    let mut prev_treble: f32 = 0.0;
+
+    let mut strobe_until: Option<Instant> = None;
+
+    // Tuning
+    let level_alpha: f32 = 0.12;  // Overall level smoothing (smaller = less, bigger = react)
+    let flux_alpha: f32  = 0.25;  // Beat smoothing
+    let beat_threshold: f32 = cfg.beat_threshold;
+    let strobe_ms: u64 = cfg.strobe_ms;
+
     loop {
         if !running.load(Ordering::SeqCst) {
             break;
         }
-        if let Err(e) = event.wait_for_event(2000) {
-            if !e.to_string().to_lowercase().contains("timed out") {
-                eprintln!("Audio wait error (ignored): {e}");
+
+        if let Err(_) = event.wait_for_event(2000) {
+            if !dimmed_due_to_silence {
+                let (r, g, b, w) = last_color;
+                let _ = tx.send(RgbwGain { r, g, b, w, overall: 0.0, transition_ms: 800, force: true});
+                dimmed_due_to_silence = true;
             }
             continue;
         }
@@ -234,11 +251,32 @@ fn main() -> Result<()> {
                     let gm = (mid / mid_peak).clamp(0.0, 1.0);
                     let bt = (treble / treble_peak).clamp(0.0, 1.0);
 
+                    let flux = ((rb - prev_bass).max(0.0) + (gm - prev_mid).max(0.0) + (bt - prev_treble).max(0.0)).clamp(0.0, 3.0) / 3.0;
+                    prev_bass = rb;
+                    prev_mid = gm;
+                    prev_treble = bt;
+                    flux_ema += flux_alpha * (flux - flux_ema);
+
                     // Brightness from overall energy
                     let overall = ((rb + gm + bt) / 3.0).clamp(0.0, 1.0);
+                    overall_ema += level_alpha * (overall - overall_ema);
+                    let now = Instant::now();
+
+                    if flux_ema > beat_threshold { strobe_until = Some(now + Duration::from_millis(strobe_ms)); }
+                    let strobing = strobe_until.map(|t| now < t).unwrap_or(false);
+                    let beat_strength = ((flux_ema - beat_threshold) / (1.0 - beat_threshold)).clamp(0.0, 1.0);
+                    let mix = (0.75 * beat_strength + 0.25 * overall_ema).clamp(0.0, 1.0);
+                    let transition_f = transition_max - mix * (transition_max - transition_min);
+                    let transition_ms = transition_f.round().clamp(0.0, u16::MAX as f32) as u16;
+
+                    let overall = if strobing { 1.0 } else { overall_ema };
                     let (r, g, b) = hue_to_two_channel_rgb(bands_to_hue(rb, gm, bt), (0.15 + 0.85 * overall).clamp(0.0, 1.0));
 
-                    let _ = tx.send(RgbwGain { r, g, b, w: 0, overall, transition_ms });
+                    if bass != 0.0 && mid != 0.0 && treble != 0.0 {
+                        dimmed_due_to_silence = false;
+                        last_color = (r, g, b, 0);
+                    }
+                    let _ = tx.send(RgbwGain { r, g, b, w: 0, overall, transition_ms, force: false});
                 }
             }
         }
