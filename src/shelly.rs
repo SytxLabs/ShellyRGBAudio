@@ -78,9 +78,20 @@ impl ShellyController {
         if let Some(a) = &self.auth {
             req = req.basic_auth(a.username.clone(), Some(a.password.clone()));
         }
-        let resp = req.send().context("Gen1 /color/0 request failed")?;
+        // If timeout log and not Crash
+        let resp = match req.send() {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_timeout() {
+                    eprintln!("Gen1 Shelly timeout (ignored): {e}");
+                    return Ok(());
+                }
+                return Err(e).context("Gen1 /color/0 request failed");
+            }
+        };
         if !resp.status().is_success() {
-            bail!("Gen1 Shelly error: HTTP {}", resp.status());
+            eprintln!("Gen1 Shelly HTTP error (ignored): {}", resp.status());
+            return Ok(());
         }
         Ok(())
     }
@@ -118,13 +129,25 @@ impl ShellyController {
         let body_bytes = serde_json::to_vec(&frame).context("serialize JSON-RPC frame")?;
 
         // 1) try without auth
-        let resp = self
-            .http
-            .post(&url)
-            .header(CONTENT_TYPE, "application/json")
-            .body(body_bytes.clone())
-            .send()
-            .context("POST /rpc failed")?;
+        let resp = match self.http.post(&url).header(CONTENT_TYPE, "application/json").body(body_bytes.clone()).send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_timeout() {
+                    eprintln!("Gen2 Shelly timeout (ignored) POST /rpc: {e}");
+                    return Ok(serde_json::Value::Null);
+                }
+                if e.is_connect() {
+                    eprintln!("Gen2 Shelly connect error (ignored) POST /rpc: {e}");
+                    return Ok(serde_json::Value::Null);
+                }
+                if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED) {
+                    return Ok(serde_json::Value::Null);
+                }
+                return Err(e).context("POST /rpc failed");
+            }
+        };
+
 
         let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             let auth = self

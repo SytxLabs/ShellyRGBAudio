@@ -18,7 +18,7 @@ struct RgbwGain {
     g: u8,
     b: u8,
     w: u8,
-    gain: u8,
+    overall: f32,
     transition_ms: u16,
 }
 
@@ -28,56 +28,55 @@ fn main() -> Result<()> {
     let min_send_interval = Duration::from_millis(cfg.change_interval_ms);
     let transition_ms: u16 = cfg.change_interval_ms.min(u16::MAX as u64) as u16;
 
-    let gain_min: f32 = 1.0;
-    let gain_max: f32 = cfg.shelly.max_brightness.clamp(1, 100) as f32;
-    let gain_min: f32 = gain_min.min(gain_max);
-    let gain_gamma: f32 = cfg.shelly.brightness_gamma.clamp(0.0, 100.0);
+    let shellys: Vec<Arc<shelly::ShellyController>> = cfg
+        .shellys
+        .iter()
+        .map(|sc| shelly::ShellyController::new(sc).map(Arc::new))
+        .collect::<Result<_>>()?;
+
+    let shellys = Arc::new(shellys);
+
+    // initial states pro device
+    let initial_states: Vec<Option<shelly::ShellyRgbwState>> = shellys.iter().map(|s| s.get_state().ok()).collect();
+
+    let initial_states = Arc::new(initial_states);
 
     // ---- Shelly controller (Gen1 RGBW2 + Gen2 Plus RGBW PM) ----
-    let shelly = Arc::new(shelly::ShellyController::new(&cfg.shelly)?);
-    let initial_state = match shelly.get_state() {
-        Ok(s) => {
-            eprintln!("Shelly initial state: {:?}", s);
-            Some(s)
-        }
-        Err(e) => {
-            eprintln!("Warn: could not read initial Shelly state: {e:#}");
-            None
-        }
-    };
-    let running = Arc::new(AtomicBool::new(true));{
+
+    let running = Arc::new(AtomicBool::new(true));
+    {
         let running = Arc::clone(&running);
         ctrlc::set_handler(move || { running.store(false, Ordering::SeqCst); })?;
     }
+
     let old_hook = std::panic::take_hook();
     {
-        let shelly = Arc::clone(&shelly);
-        let initial_state = initial_state; // move
+        let shellys = Arc::clone(&shellys);
+        let initial_states = Arc::clone(&initial_states);
+
         std::panic::set_hook(Box::new(move |info| {
-            if let Some(s) = initial_state {
-                let _ = shelly.restore_state(s);
+            for (i, sh) in shellys.iter().enumerate() {
+                if let Some(st) = initial_states.get(i).and_then(|x| *x) {
+                    let _ = sh.restore_state(st);
+                }
             }
             old_hook(info);
         }));
     }
-    let initial_state = initial_state;
 
     let fft_size: usize = 1024;
     let max_sample_rate_assumption: u32 = 48_000;
 
     let (tx, rx) = mpsc::channel::<RgbwGain>();
     let _sender_thread = {
-        let shelly = Arc::clone(&shelly);
+        let shellys = Arc::clone(&shellys);
+        let per_min: Arc<Vec<u8>> = Arc::new(cfg.shellys.iter().map(|s| s.min_brightness.clamp(0, 100)).collect());
+        let per_max: Arc<Vec<u8>> = Arc::new(cfg.shellys.iter().map(|s| s.max_brightness.clamp(1, 100)).collect());
+        let per_gamma: Arc<Vec<f32>> = Arc::new(cfg.shellys.iter().map(|s| s.brightness_gamma).collect());
+
         thread::spawn(move || {
             let mut last_sent = Instant::now() - min_send_interval;
-            let mut last = RgbwGain {
-                r: 0,
-                g: 0,
-                b: 0,
-                w: 0,
-                gain: 0,
-                transition_ms,
-            };
+            let mut last = RgbwGain { r: 0, g: 0, b: 0, w: 0, overall: 0.0, transition_ms };
 
             while let Ok(mut v) = rx.recv() {
                 while let Ok(newer) = rx.try_recv() {
@@ -86,17 +85,24 @@ fn main() -> Result<()> {
                 if last_sent.elapsed() < min_send_interval {
                     continue;
                 }
-                let changed = (v.r as i16 - last.r as i16).abs() > 3 || (v.g as i16 - last.g as i16).abs() > 3 || (v.b as i16 - last.b as i16).abs() > 3 || (v.gain as i16 - last.gain as i16).abs() > 2;
-                if !changed {
-                    continue;
-                }
+                let changed = (v.r as i16 - last.r as i16).abs() > 3 || (v.g as i16 - last.g as i16).abs() > 3 || (v.b as i16 - last.b as i16).abs() > 3 || (v.overall - last.overall).abs() > 0.02;
+                if !changed { continue; }
                 v.transition_ms = transition_ms;
-                if let Err(e) = shelly.set_rgbw(v.r, v.g, v.b, v.w, v.gain, v.transition_ms as u32) {
-                    eprintln!("Shelly send error: {e:#}");
-                } else {
-                    last = v;
-                    last_sent = Instant::now();
+                for (i, sh) in shellys.iter().enumerate() {
+                    let minb = per_min.get(i).copied().unwrap_or(0) as f32;
+                    let maxb = per_max.get(i).copied().unwrap_or(100) as f32;
+                    let gamma = per_gamma.get(i).copied().unwrap_or(1.0).clamp(0.1, 5.0);
+                    let (minb, maxb) = if minb > maxb { (maxb, minb) } else { (minb, maxb) };
+
+                    let shaped = v.overall.clamp(0.0, 1.0).powf(gamma);
+                    let mut brightness = (minb + shaped * (maxb - minb)).round() as u8;
+                    if brightness == 0 { brightness = 1; }
+                    if let Err(e) = sh.set_rgbw(v.r, v.g, v.b, v.w, brightness, v.transition_ms as u32) {
+                        eprintln!("Shelly[{i}] send error: {e:#}");
+                    }
                 }
+                last = v;
+                last_sent = Instant::now();
             }
         })
     };
@@ -231,24 +237,19 @@ fn main() -> Result<()> {
 
                     // Brightness from overall energy
                     let overall = ((rb + gm + bt) / 3.0).clamp(0.0, 1.0);
-                    let hue = bands_to_hue(rb, gm, bt);
-                    let value = (0.15 + 0.85 * overall).clamp(0.0, 1.0);
-                    let (r, g, b) = hue_to_two_channel_rgb(hue, value);
-                    let shaped = overall.powf(gain_gamma);
-                    let mut gain = (gain_min + shaped * (gain_max - gain_min)).round() as u8;
-                    if gain == 0 { gain = 1; }
+                    let (r, g, b) = hue_to_two_channel_rgb(bands_to_hue(rb, gm, bt), (0.15 + 0.85 * overall).clamp(0.0, 1.0));
 
-                    let out = RgbwGain { r, g, b, w: 0, gain, transition_ms, };
-                    let _ = tx.send(out);
+                    let _ = tx.send(RgbwGain { r, g, b, w: 0, overall, transition_ms });
                 }
             }
         }
     }
 
-    if let Some(s) = initial_state {
-        eprintln!("Restoring Shelly state...");
-        if let Err(e) = shelly.restore_state(s) {
-            eprintln!("Restore failed: {e:#}");
+    for (i, sh) in shellys.iter().enumerate() {
+        if let Some(st) = initial_states.get(i).and_then(|x| *x) {
+            if let Err(e) = sh.restore_state(st) {
+                eprintln!("Shelly[{i}] restore failed: {e:#}");
+            }
         }
     }
     Ok(())

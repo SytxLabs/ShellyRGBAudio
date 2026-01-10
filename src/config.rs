@@ -7,7 +7,7 @@ use serde_json::Value;
 pub struct AppConfig {
     pub change_interval_ms: u64,
     pub audio_device: AudioDeviceSelector,
-    pub shelly: ShellyConfig,
+    pub shellys: Vec<ShellyConfig>,
 }
 
 impl Default for AppConfig {
@@ -15,40 +15,27 @@ impl Default for AppConfig {
         Self {
             change_interval_ms: 120,
             audio_device: AudioDeviceSelector::Default,
-            shelly: ShellyConfig::default(),
+            shellys: vec![ShellyConfig::default()],
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellyConfig {
-    /// e.g. "192.168.1.50" or "http://192.168.1.50"
     pub host: String,
-
-    /// "auto" tries to detect Gen1 vs. Gen2 via `/shelly`
     pub device: ShellyDevice,
-    
+    pub min_brightness: u8,
     pub max_brightness: u8,
-
-    /// Gamma < 1 → hebt leise Stellen an, macht Range "gefühlt" größer.
-    /// Gamma > 1 → macht leise Stellen dunkler, Peaks stärker
     pub brightness_gamma: f32,
-
-    /// Gen2 RGBW component id (usually 0). Used for Shelly Plus RGBW PM in rgbw profile.
     pub rgbw_id: u8,
-
-    /// Optional auth (Gen1: basic; Gen2: digest)
     pub auth: Option<ShellyAuth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AudioDeviceSelector {
-    /// Nimmt das Standard-Output-Gerät (Console Role)
     Default,
-    /// Gerät per WASAPI Device Id auswählen (stabil, am besten)
     Id { id: String },
-    /// Gerät per Name auswählen (z.B. "Speakers (Realtek...)")
     Name { name: String },
 }
 
@@ -58,6 +45,7 @@ impl Default for ShellyConfig {
         Self {
             host: "192.168.178.50".to_string(),
             device: ShellyDevice::Auto,
+            min_brightness: 1,
             max_brightness: 80,
             brightness_gamma: 0.6,
             rgbw_id: 0,
@@ -96,6 +84,27 @@ fn merge_defaults(user: &mut Value, defaults: &Value) {
     }
 }
 
+fn merge_defaults_into_shellys(merged: &mut Value, defaults: &Value) {
+    let def_item = defaults.get("shellys")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if let Some(arr) = merged.get_mut("shellys").and_then(|v| v.as_array_mut()) {
+        if arr.is_empty() {
+            arr.push(def_item);
+            return;
+        }
+        for item in arr.iter_mut() {
+            merge_defaults(item, &def_item);
+        }
+    } else {
+        merged["shellys"] = Value::Array(vec![def_item]);
+    }
+}
+
+
 pub fn load_or_create(path: &str) -> Result<AppConfig> {
     let p = Path::new(path);
     let defaults_cfg = AppConfig::default();
@@ -103,7 +112,7 @@ pub fn load_or_create(path: &str) -> Result<AppConfig> {
 
     if !p.exists() {
         write_pretty(path, &defaults_val)?;
-        eprintln!("Created default {path}. Bitte anpassen und neu starten (optional).");
+        eprintln!("Created default {path}. Please adjust and restart (optional).");
         return Ok(defaults_cfg);
     }
 
@@ -123,8 +132,15 @@ pub fn load_or_create(path: &str) -> Result<AppConfig> {
         eprintln!("Config root is not an object. Replacing with defaults.");
         defaults_val.clone()
     };
+    if merged.get("shellys").is_none() {
+        if let Some(old) = merged.get("shelly").cloned() {
+            merged.as_object_mut().unwrap().remove("shelly");
+            merged["shellys"] = Value::Array(vec![old]);
+        }
+    }
 
     merge_defaults(&mut merged, &defaults_val);
+    merge_defaults_into_shellys(&mut merged, &defaults_val);
 
     let cfg: AppConfig = match serde_json::from_value(merged.clone()) {
         Ok(c) => c,
