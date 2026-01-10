@@ -4,6 +4,7 @@ A high-performance Rust application that synchronizes your Shelly RGBW lights wi
 
 ## Features
 
+- **Multi-Device Support:** Synchronize multiple Shelly devices simultaneously.
 - **Low Latency:** Written in Rust with optimized audio capture and processing.
 - **Cross-Generation Support:** Works with both Shelly Gen1 (RGBW2) and Gen2 (Plus RGBW PM) devices.
 - **Auto-Detection:** Automatically detects the Shelly API version.
@@ -32,27 +33,31 @@ On the first run, the application creates a `config.json` file in the root direc
   "audio_device": {
     "type": "default"
   },
-  "shelly": {
-    "host": "192.168.1.50",
-    "device": "auto",
-    "max_brightness": 80,
-    "brightness_gamma": 0.8,
-    "rgbw_id": 0,
-    "auth": null
-  }
+  "shellys": [
+    {
+      "host": "192.168.1.50",
+      "device": "auto",
+      "min_brightness": 1,
+      "max_brightness": 80,
+      "brightness_gamma": 0.6,
+      "rgbw_id": 0,
+      "auth": null
+    }
+  ]
 }
 ```
 ### Config Settings
-| Setting                   | Description                                                                                                                                                                                         |
-|---------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `change_interval_ms`      | Interval in milliseconds between color updates. Lower values increase responsiveness but may strain the Shelly device.                                                                              |
-| `audio_device`            | Selection method for the audio output device. Can be `{"type": "default"}`, `{"type": "id", "id": "..."}`, or `{"type": "name", "name": "..."}`. If "name" or "id" is empty all devices are listed. |
-| `shelly.host`             | IP address or hostname of your Shelly device (e.g., `192.168.1.50`).                                                                                                                                |
-| `shelly.device`           | API version: `auto` (detects automatically), `rgbw2` (Gen1), or `plus_rgbw_pm` (Gen2).                                                                                                              |
-| `shelly.max_brightness`   | Upper limit for brightness (1-100).                                                                                                                                                                 |
-| `shelly.brightness_gamma` | Gamma correction for brightness. Values < 1 make low volumes brighter; > 1 make peaks more prominent.                                                                                               |
-| `shelly.rgbw_id`          | The component ID (usually 0). Relevant for Gen2 devices.                                                                                                                                            |
-| `shelly.auth`             | Optional: `{"username": "...", "password": "..."}` for password-protected devices.                                                                                                                  |
+| Setting                      | Description                                                                                                                                                                                         |
+|------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `change_interval_ms`         | Interval in milliseconds between color updates. Lower values increase responsiveness but may strain the Shelly device.                                                                              |
+| `audio_device`               | Selection method for the audio output device. Can be `{"type": "default"}`, `{"type": "id", "id": "..."}`, or `{"type": "name", "name": "..."}`. If "name" or "id" is empty all devices are listed. |
+| `shellys[].host`             | IP address or hostname of your Shelly device (e.g., `192.168.1.50`).                                                                                                                                |
+| `shellys[].device`           | API version: `auto` (detects automatically), `rgbw2` (Gen1), or `plus_rgbw_pm` (Gen2).                                                                                                              |
+| `shellys[].min_brightness`   | Lower limit for brightness (0-100).                                                                                                                                                                 |
+| `shellys[].max_brightness`   | Upper limit for brightness (1-100).                                                                                                                                                                 |
+| `shellys[].brightness_gamma` | Gamma correction for brightness. Values < 1 make low volumes brighter; > 1 make peaks more prominent.                                                                                               |
+| `shellys[].rgbw_id`          | The component ID (usually 0). Relevant for Gen2 devices.                                                                                                                                            |
+| `shellys[].auth`             | Optional: `{"username": "...", "password": "..."}` for password-protected devices.                                                                                                                  |
 
 ## Troubleshooting
 
