@@ -1,5 +1,6 @@
 mod config;
 mod shelly;
+mod govee;
 
 use crate::config::AudioDeviceSelector;
 use anyhow::{anyhow, Context, Result};
@@ -29,12 +30,18 @@ fn main() -> Result<()> {
     let min_send_interval = Duration::from_millis(cfg.change_interval_ms);
     let transition_min = cfg.transition_min_ms as f32;
     let transition_max = cfg.transition_max_ms as f32;
+    let govee = Arc::new(govee::GoveeLan::new()?);
+    let govees = Arc::new(cfg.govees.clone());
 
     let shellys: Vec<Arc<shelly::ShellyController>> = cfg
         .shellys
         .iter()
         .map(|sc| shelly::ShellyController::new(sc).map(Arc::new))
         .collect::<Result<_>>()?;
+
+    let govee_initial: Vec<Option<govee::GoveeState>> = govees.iter()
+        .map(|d| govee.get_state(&d.ip).ok())
+        .collect();
 
     let shellys = Arc::new(shellys);
     let initial_states: Vec<Option<shelly::ShellyRgbwState>> = shellys.iter().map(|s| s.get_state().ok()).collect();
@@ -69,6 +76,8 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel::<RgbwGain>();
     let _sender_thread = {
         let shellys = Arc::clone(&shellys);
+        let govee = Arc::clone(&govee);
+        let govees = Arc::clone(&govees);
         let per_min: Arc<Vec<u8>> = Arc::new(cfg.shellys.iter().map(|s| s.min_brightness.clamp(0, 100)).collect());
         let per_max: Arc<Vec<u8>> = Arc::new(cfg.shellys.iter().map(|s| s.max_brightness.clamp(1, 100)).collect());
         let per_gamma: Arc<Vec<f32>> = Arc::new(cfg.shellys.iter().map(|s| s.brightness_gamma).collect());
@@ -98,6 +107,21 @@ fn main() -> Result<()> {
                     if let Err(e) = sh.set_rgbw(v.r, v.g, v.b, v.w, brightness, v.transition_ms as u32) {
                         eprintln!("Shelly[{i}] send error: {e:#}");
                     }
+                }
+
+                for (_i, dev) in govees.iter().enumerate() {
+                    // brightness aus overall + gamma + min/max
+                    let min_b = dev.min_brightness.clamp(0, 100) as f32;
+                    let max_b = dev.max_brightness.clamp(1, 100) as f32;
+                    let gamma = dev.brightness_gamma.clamp(0.1, 5.0);
+
+                    let shaped = v.overall.clamp(0.0, 1.0).powf(gamma);
+                    let mut bri = (min_b + shaped * (max_b - min_b)).round() as u8;
+                    if bri == 0 { bri = 1; } // Govee brightness ist 1..100 :contentReference[oaicite:9]{index=9}
+
+                    let _ = govee.turn(&dev.ip, true);
+                    let _ = govee.set_brightness(&dev.ip, bri);
+                    let _ = govee.set_rgb(&dev.ip, v.r, v.g, v.b);
                 }
                 last = v;
                 last_sent = Instant::now();
@@ -286,6 +310,13 @@ fn main() -> Result<()> {
         if let Some(st) = initial_states.get(i).and_then(|x| *x) {
             if let Err(e) = sh.restore_state(st) {
                 eprintln!("Shelly[{i}] restore failed: {e:#}");
+            }
+        }
+    }
+    for (i, g) in govees.iter().enumerate() {
+        if let Some(st) = govee_initial.get(i).and_then(|x| *x) {
+            if let Err(e) = govee.restore_state(&g.ip, st) {
+                eprintln!("Govee[{i}] restore failed: {e:#}");
             }
         }
     }

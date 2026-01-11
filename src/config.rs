@@ -8,6 +8,7 @@ pub struct AppConfig {
     pub change_interval_ms: u64,
     pub audio_device: AudioDeviceSelector,
     pub shellys: Vec<ShellyConfig>,
+    pub govees: Vec<GoveeLanConfig>,
     pub transition_min_ms: u64,
     pub transition_max_ms: u64,
     pub beat_threshold: f32,
@@ -20,6 +21,7 @@ impl Default for AppConfig {
             change_interval_ms: 120,
             audio_device: AudioDeviceSelector::Default,
             shellys: vec![ShellyConfig::default()],
+            govees: vec![],
             transition_min_ms: 60,
             transition_max_ms: 600,
             beat_threshold: 0.18,
@@ -37,6 +39,15 @@ pub struct ShellyConfig {
     pub brightness_gamma: f32,
     pub rgbw_id: u8,
     pub auth: Option<ShellyAuth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoveeLanConfig {
+    pub ip: String,
+    pub name: Option<String>,
+    pub min_brightness: u8,
+    pub max_brightness: u8,
+    pub brightness_gamma: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +69,18 @@ impl Default for ShellyConfig {
             brightness_gamma: 0.6,
             rgbw_id: 0,
             auth: None,
+        }
+    }
+}
+
+impl Default for GoveeLanConfig {
+    fn default() -> Self {
+        Self {
+            ip: "192.168.1.60".to_string(),
+            name: Some("H6008".to_string()),
+            min_brightness: 1,
+            max_brightness: 80,
+            brightness_gamma: 0.6,
         }
     }
 }
