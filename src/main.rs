@@ -24,28 +24,45 @@ struct RgbwGain {
     force: bool,
 }
 
+enum RuntimeDevice {
+    Shelly {
+        cfg: config::ShellyConfig,
+        ctrl: Arc<shelly::ShellyController>,
+        initial: Option<shelly::ShellyRgbwState>,
+    },
+    Govee {
+        cfg: config::GoveeLanConfig,
+        initial: Option<govee::GoveeState>,
+    },
+}
+
 fn main() -> Result<()> {
     let cfg = config::load_or_create("config.json")?;
+
+    let mut runtime: Vec<RuntimeDevice> = Vec::new();
+
+    let has_govee = cfg.devices.iter().any(|d| matches!(d, config::DeviceConfig::GoveeLan(_)));
+    let govee_client = if has_govee { Some(Arc::new(govee::GoveeLan::new()?)) } else { None };
+
+    for dev in &cfg.devices {
+        match dev {
+            config::DeviceConfig::Shelly(sc) => {
+                let ctrl = Arc::new(shelly::ShellyController::new(sc)?);
+                let initial = ctrl.get_state().ok();
+                runtime.push(RuntimeDevice::Shelly { cfg: sc.clone(), ctrl, initial, });
+            }
+            config::DeviceConfig::GoveeLan(gc) => {
+                let initial = govee_client.as_ref().and_then(|c| c.get_state(&gc.ip).ok());
+                runtime.push(RuntimeDevice::Govee { cfg: gc.clone(), initial, });
+            }
+        }
+    }
+
+    let runtime = Arc::new(runtime);
 
     let min_send_interval = Duration::from_millis(cfg.change_interval_ms);
     let transition_min = cfg.transition_min_ms as f32;
     let transition_max = cfg.transition_max_ms as f32;
-    let govee = Arc::new(govee::GoveeLan::new()?);
-    let govees = Arc::new(cfg.govees.clone());
-
-    let shellys: Vec<Arc<shelly::ShellyController>> = cfg
-        .shellys
-        .iter()
-        .map(|sc| shelly::ShellyController::new(sc).map(Arc::new))
-        .collect::<Result<_>>()?;
-
-    let govee_initial: Vec<Option<govee::GoveeState>> = govees.iter()
-        .map(|d| govee.get_state(&d.ip).ok())
-        .collect();
-
-    let shellys = Arc::new(shellys);
-    let initial_states: Vec<Option<shelly::ShellyRgbwState>> = shellys.iter().map(|s| s.get_state().ok()).collect();
-    let initial_states = Arc::new(initial_states);
 
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -55,18 +72,28 @@ fn main() -> Result<()> {
 
     let old_hook = std::panic::take_hook();
     {
-        let shellys = Arc::clone(&shellys);
-        let initial_states = Arc::clone(&initial_states);
+        let runtime = Arc::clone(&runtime);
+        let govee_client_for_panic = govee_client.clone();
 
         std::panic::set_hook(Box::new(move |info| {
-            for (i, sh) in shellys.iter().enumerate() {
-                if let Some(st) = initial_states.get(i).and_then(|x| *x) {
-                    let _ = sh.restore_state(st);
+            for dev in runtime.iter() {
+                match dev {
+                    RuntimeDevice::Shelly { ctrl, initial, .. } => {
+                        if let Some(st) = initial.clone() {
+                            let _ = ctrl.restore_state(st);
+                        }
+                    }
+                    RuntimeDevice::Govee { cfg, initial } => {
+                        if let (Some(g), Some(st)) = (govee_client_for_panic.as_ref(), initial.clone()) {
+                            let _ = g.restore_state(&cfg.ip, st);
+                        }
+                    }
                 }
             }
             old_hook(info);
         }));
     }
+
 
     let mut dimmed_due_to_silence = false;
     let mut last_color: (u8, u8, u8, u8) = (255, 0, 0, 0);
@@ -75,59 +102,64 @@ fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<RgbwGain>();
     let _sender_thread = {
-        let shellys = Arc::clone(&shellys);
-        let govee = Arc::clone(&govee);
-        let govees = Arc::clone(&govees);
-        let per_min: Arc<Vec<u8>> = Arc::new(cfg.shellys.iter().map(|s| s.min_brightness.clamp(0, 100)).collect());
-        let per_max: Arc<Vec<u8>> = Arc::new(cfg.shellys.iter().map(|s| s.max_brightness.clamp(1, 100)).collect());
-        let per_gamma: Arc<Vec<f32>> = Arc::new(cfg.shellys.iter().map(|s| s.brightness_gamma).collect());
+        let runtime = Arc::clone(&runtime);
+        let govee_client_for_sender = govee_client.clone();
 
         thread::spawn(move || {
             let mut last_sent = Instant::now() - min_send_interval;
-            let mut last = RgbwGain { r: 0, g: 0, b: 0, w: 0, overall: 0.0, transition_ms: 0, force: false};
+            let mut last = RgbwGain { r: 0, g: 0, b: 0, w: 0, overall: 0.0, transition_ms: 0, force: false };
 
             while let Ok(mut v) = rx.recv() {
-                while let Ok(newer) = rx.try_recv() {
-                    v = newer;
-                }
-                if last_sent.elapsed() < min_send_interval {
-                    continue;
-                }
-                let changed = (v.r as i16 - last.r as i16).abs() > 3 || (v.g as i16 - last.g as i16).abs() > 3 || (v.b as i16 - last.b as i16).abs() > 3 || (v.overall - last.overall).abs() > 0.02;
-                if !changed && !v.force { continue; }
-                for (i, sh) in shellys.iter().enumerate() {
-                    let min_b = per_min.get(i).copied().unwrap_or(0) as f32;
-                    let max_b = per_max.get(i).copied().unwrap_or(100) as f32;
-                    let gamma = per_gamma.get(i).copied().unwrap_or(1.0).clamp(0.1, 5.0);
-                    let (min_b, max_b) = if min_b > max_b { (max_b, min_b) } else { (min_b, max_b) };
+                while let Ok(newer) = rx.try_recv() { v = newer; }
 
-                    let shaped = v.overall.clamp(0.0, 1.0).powf(gamma);
-                    let mut brightness = (min_b + shaped * (max_b - min_b)).round() as u8;
-                    if brightness == 0 { brightness = 1; }
-                    if let Err(e) = sh.set_rgbw(v.r, v.g, v.b, v.w, brightness, v.transition_ms as u32) {
-                        eprintln!("Shelly[{i}] send error: {e:#}");
+                if last_sent.elapsed() < min_send_interval { continue; }
+
+                let changed =
+                    (v.r as i16 - last.r as i16).abs() > 3 ||
+                        (v.g as i16 - last.g as i16).abs() > 3 ||
+                        (v.b as i16 - last.b as i16).abs() > 3 ||
+                        (v.overall - last.overall).abs() > 0.02;
+
+                if !changed && !v.force { continue; }
+
+                for dev in runtime.iter() {
+                    match dev {
+                        RuntimeDevice::Shelly { cfg, ctrl, .. } => {
+                            let minb = cfg.min_brightness.clamp(0, 100) as f32;
+                            let maxb = cfg.max_brightness.clamp(1, 100) as f32;
+                            let gamma = cfg.brightness_gamma.clamp(0.1, 5.0);
+
+                            let shaped = v.overall.clamp(0.0, 1.0).powf(gamma);
+                            let mut bri = (minb + shaped * (maxb - minb)).round() as u8;
+                            if bri == 0 { bri = 1; }
+
+                            let _ = ctrl.set_rgbw(v.r, v.g, v.b, v.w, bri, v.transition_ms as u32);
+                        }
+
+                        RuntimeDevice::Govee { cfg, .. } => {
+                            let Some(g) = govee_client_for_sender.as_ref() else { continue; };
+
+                            let minb = cfg.min_brightness.clamp(0, 100) as f32;
+                            let maxb = cfg.max_brightness.clamp(1, 100) as f32;
+                            let gamma = cfg.brightness_gamma.clamp(0.1, 5.0);
+
+                            let shaped = v.overall.clamp(0.0, 1.0).powf(gamma);
+                            let mut bri = (minb + shaped * (maxb - minb)).round() as u8;
+                            if bri == 0 { bri = 1; }
+
+                            let _ = g.turn(&cfg.ip, true);
+                            let _ = g.set_brightness(&cfg.ip, bri);
+                            let _ = g.set_rgb(&cfg.ip, v.r, v.g, v.b);
+                        }
                     }
                 }
 
-                for (_i, dev) in govees.iter().enumerate() {
-                    // brightness aus overall + gamma + min/max
-                    let min_b = dev.min_brightness.clamp(0, 100) as f32;
-                    let max_b = dev.max_brightness.clamp(1, 100) as f32;
-                    let gamma = dev.brightness_gamma.clamp(0.1, 5.0);
-
-                    let shaped = v.overall.clamp(0.0, 1.0).powf(gamma);
-                    let mut bri = (min_b + shaped * (max_b - min_b)).round() as u8;
-                    if bri == 0 { bri = 1; } // Govee brightness ist 1..100 :contentReference[oaicite:9]{index=9}
-
-                    let _ = govee.turn(&dev.ip, true);
-                    let _ = govee.set_brightness(&dev.ip, bri);
-                    let _ = govee.set_rgb(&dev.ip, v.r, v.g, v.b);
-                }
                 last = v;
                 last_sent = Instant::now();
             }
         })
     };
+
 
     initialize_mta().ok().context("initialize_mta failed (COM init; avoid calling from STA UI thread)")?;
 
@@ -306,20 +338,21 @@ fn main() -> Result<()> {
         }
     }
 
-    for (i, sh) in shellys.iter().enumerate() {
-        if let Some(st) = initial_states.get(i).and_then(|x| *x) {
-            if let Err(e) = sh.restore_state(st) {
-                eprintln!("Shelly[{i}] restore failed: {e:#}");
+    for dev in runtime.iter() {
+        match dev {
+            RuntimeDevice::Shelly { ctrl, initial, .. } => {
+                if let Some(st) = initial.clone() {
+                    let _ = ctrl.restore_state(st);
+                }
+            }
+            RuntimeDevice::Govee { cfg, initial } => {
+                if let (Some(g), Some(st)) = (govee_client.as_ref(), initial.clone()) {
+                    let _ = g.restore_state(&cfg.ip, st);
+                }
             }
         }
     }
-    for (i, g) in govees.iter().enumerate() {
-        if let Some(st) = govee_initial.get(i).and_then(|x| *x) {
-            if let Err(e) = govee.restore_state(&g.ip, st) {
-                eprintln!("Govee[{i}] restore failed: {e:#}");
-            }
-        }
-    }
+
     Ok(())
 }
 

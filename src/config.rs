@@ -7,12 +7,19 @@ use serde_json::Value;
 pub struct AppConfig {
     pub change_interval_ms: u64,
     pub audio_device: AudioDeviceSelector,
-    pub shellys: Vec<ShellyConfig>,
-    pub govees: Vec<GoveeLanConfig>,
     pub transition_min_ms: u64,
     pub transition_max_ms: u64,
     pub beat_threshold: f32,
     pub strobe_ms: u64,
+
+    pub devices: Vec<DeviceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DeviceConfig {
+    Shelly(ShellyConfig),
+    GoveeLan(GoveeLanConfig),
 }
 
 impl Default for AppConfig {
@@ -20,12 +27,12 @@ impl Default for AppConfig {
         Self {
             change_interval_ms: 120,
             audio_device: AudioDeviceSelector::Default,
-            shellys: vec![ShellyConfig::default()],
-            govees: vec![],
             transition_min_ms: 60,
             transition_max_ms: 600,
             beat_threshold: 0.18,
             strobe_ms: 40,
+
+            devices: vec![DeviceConfig::Shelly(ShellyConfig::default())],
         }
     }
 }
@@ -115,26 +122,6 @@ fn merge_defaults(user: &mut Value, defaults: &Value) {
     }
 }
 
-fn merge_defaults_into_shellys(merged: &mut Value, defaults: &Value) {
-    let def_item = defaults.get("shellys")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    if let Some(arr) = merged.get_mut("shellys").and_then(|v| v.as_array_mut()) {
-        if arr.is_empty() {
-            arr.push(def_item);
-            return;
-        }
-        for item in arr.iter_mut() {
-            merge_defaults(item, &def_item);
-        }
-    } else {
-        merged["shellys"] = Value::Array(vec![def_item]);
-    }
-}
-
 
 pub fn load_or_create(path: &str) -> Result<AppConfig> {
     let p = Path::new(path);
@@ -170,8 +157,45 @@ pub fn load_or_create(path: &str) -> Result<AppConfig> {
         }
     }
 
+    if merged.get("devices").is_none() {
+        let mut devices = Vec::new();
+
+        if let Some(arr) = merged.get("shellys").and_then(|v| v.as_array()) {
+            for it in arr {
+                devices.push(serde_json::json!({"type": "shelly"}));
+                if let Some(obj) = devices.last_mut().and_then(|v| v.as_object_mut()) {
+                    if let Some(src) = it.as_object() {
+                        for (k, v) in src {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(arr) = merged.get("govees").and_then(|v| v.as_array()) {
+            for it in arr {
+                devices.push(serde_json::json!({ "type": "govee_lan" }));
+                if let Some(obj) = devices.last_mut().and_then(|v| v.as_object_mut()) {
+                    if let Some(src) = it.as_object() {
+                        for (k, v) in src {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !devices.is_empty() {
+            merged["devices"] = Value::Array(devices);
+        }
+    }
+    if let Some(obj) = merged.as_object_mut() {
+        obj.remove("shellys");
+        obj.remove("govees");
+    }
+
     merge_defaults(&mut merged, &defaults_val);
-    merge_defaults_into_shellys(&mut merged, &defaults_val);
 
     let cfg: AppConfig = match serde_json::from_value(merged.clone()) {
         Ok(c) => c,
