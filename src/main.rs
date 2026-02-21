@@ -5,24 +5,11 @@ mod govee;
 use crate::config::AudioDeviceSelector;
 use anyhow::{anyhow, Context, Result};
 use rustfft::{num_complex::Complex32, FftPlanner};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::{
-    sync::{mpsc, Arc},
-    thread,
-    time::{Duration, Instant},
-};
+use std::{ sync::{mpsc, Arc, atomic::{AtomicBool, Ordering}}, thread, time::{Duration, Instant} };
 use wasapi::{initialize_mta, Device, DeviceEnumerator, Direction, StreamMode};
 
 #[derive(Clone, Copy, Debug)]
-struct RgbwGain {
-    r: u8,
-    g: u8,
-    b: u8,
-    w: u8,
-    overall: f32,
-    transition_ms: u16,
-    force: bool,
-}
+struct RgbwGain { r: u8, g: u8, b: u8, w: u8, overall: f32, transition_ms: u16, force: bool }
 
 enum RuntimeDevice {
     Shelly {
@@ -49,11 +36,10 @@ fn main() -> Result<()> {
             config::DeviceConfig::Shelly(sc) => {
                 let ctrl = Arc::new(shelly::ShellyController::new(sc)?);
                 let initial = ctrl.get_state().ok();
-                runtime.push(RuntimeDevice::Shelly { cfg: sc.clone(), ctrl, initial, });
+                runtime.push(RuntimeDevice::Shelly { cfg: sc.clone(), ctrl, initial });
             }
             config::DeviceConfig::GoveeLan(gc) => {
-                let initial = govee_client.as_ref().and_then(|c| c.get_state(&gc.ip).ok());
-                runtime.push(RuntimeDevice::Govee { cfg: gc.clone(), initial, });
+                runtime.push(RuntimeDevice::Govee { cfg: gc.clone(), initial: govee_client.as_ref().and_then(|c| c.get_state(&gc.ip).ok()) });
             }
         }
     }
@@ -76,20 +62,7 @@ fn main() -> Result<()> {
         let govee_client_for_panic = govee_client.clone();
 
         std::panic::set_hook(Box::new(move |info| {
-            for dev in runtime.iter() {
-                match dev {
-                    RuntimeDevice::Shelly { ctrl, initial, .. } => {
-                        if let Some(st) = initial.clone() {
-                            let _ = ctrl.restore_state(st);
-                        }
-                    }
-                    RuntimeDevice::Govee { cfg, initial } => {
-                        if let (Some(g), Some(st)) = (govee_client_for_panic.as_ref(), initial.clone()) {
-                            let _ = g.restore_state(&cfg.ip, st);
-                        }
-                    }
-                }
-            }
+            restore_last_state(&runtime, &govee_client_for_panic);
             old_hook(info);
         }));
     }
@@ -113,26 +86,16 @@ fn main() -> Result<()> {
                 while let Ok(newer) = rx.try_recv() { v = newer; }
 
                 if last_sent.elapsed() < min_send_interval { continue; }
-
-                let changed =
-                    (v.r as i16 - last.r as i16).abs() > 3 ||
-                        (v.g as i16 - last.g as i16).abs() > 3 ||
-                        (v.b as i16 - last.b as i16).abs() > 3 ||
-                        (v.overall - last.overall).abs() > 0.02;
-
+                let changed = (v.r as i16 - last.r as i16).abs() > 3 || (v.g as i16 - last.g as i16).abs() > 3 || (v.b as i16 - last.b as i16).abs() > 3 || (v.overall - last.overall).abs() > 0.02;
                 if !changed && !v.force { continue; }
 
                 for dev in runtime.iter() {
                     match dev {
                         RuntimeDevice::Shelly { cfg, ctrl, .. } => {
                             let minb = cfg.min_brightness.clamp(0, 100) as f32;
-                            let maxb = cfg.max_brightness.clamp(1, 100) as f32;
-                            let gamma = cfg.brightness_gamma.clamp(0.1, 5.0);
-
-                            let shaped = v.overall.clamp(0.0, 1.0).powf(gamma);
-                            let mut bri = (minb + shaped * (maxb - minb)).round() as u8;
+                            let shaped = v.overall.clamp(0.0, 1.0).powf(cfg.brightness_gamma.clamp(0.1, 5.0));
+                            let mut bri = (minb + shaped * ((cfg.max_brightness.clamp(1, 100) as f32) - minb)).round() as u8;
                             if bri == 0 { bri = 1; }
-
                             let _ = ctrl.set_rgbw(v.r, v.g, v.b, v.w, bri, v.transition_ms as u32);
                         }
 
@@ -140,11 +103,8 @@ fn main() -> Result<()> {
                             let Some(g) = govee_client_for_sender.as_ref() else { continue; };
 
                             let minb = cfg.min_brightness.clamp(0, 100) as f32;
-                            let maxb = cfg.max_brightness.clamp(1, 100) as f32;
-                            let gamma = cfg.brightness_gamma.clamp(0.1, 5.0);
-
-                            let shaped = v.overall.clamp(0.0, 1.0).powf(gamma);
-                            let mut bri = (minb + shaped * (maxb - minb)).round() as u8;
+                            let shaped = v.overall.clamp(0.0, 1.0).powf(cfg.brightness_gamma.clamp(0.1, 5.0));
+                            let mut bri = (minb + shaped * ((cfg.max_brightness.clamp(1, 100) as f32) - minb)).round() as u8;
                             if bri == 0 { bri = 1; }
 
                             let _ = g.turn(&cfg.ip, true);
@@ -200,10 +160,7 @@ fn main() -> Result<()> {
     let mut audio_client = device.get_iaudioclient()?;
     let desired_format = audio_client.get_mixformat()?;
 
-    let buffer_duration_hns = 200_000; // 20ms in 100ns units
-    let autoconvert = true;
-    let mode = StreamMode::EventsShared { autoconvert, buffer_duration_hns };
-
+    let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: 200_000 };
     audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
     let capture = audio_client.get_audiocaptureclient()?;
     let event = audio_client.set_get_eventhandle()?;
@@ -337,7 +294,11 @@ fn main() -> Result<()> {
             }
         }
     }
+    restore_last_state(&runtime, &govee_client);
+    Ok(())
+}
 
+fn restore_last_state(runtime: &[RuntimeDevice], govee_client: &Option<Arc<govee::GoveeLan>>) {
     for dev in runtime.iter() {
         match dev {
             RuntimeDevice::Shelly { ctrl, initial, .. } => {
@@ -352,8 +313,6 @@ fn main() -> Result<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 
@@ -402,20 +361,13 @@ fn hue_to_two_channel_rgb(hue_deg: f32, value: f32) -> (u8, u8, u8) {
     let v = value.clamp(0.0, 1.0);
 
     let (r, g, b) = if hue < 120.0 {
-        let t = hue / 120.0;
-        (1.0, t, 0.0)                 // R->RG
+        (1.0, hue / 120.0, 0.0)                 // R->RG
     } else if hue < 240.0 {
-        let t = (hue - 120.0) / 120.0;
-        (0.0, 1.0, t)                 // G->GB
+        (0.0, 1.0, (hue - 120.0) / 120.0)       // G->GB
     } else {
-        let t = (hue - 240.0) / 120.0;
-        (t, 0.0, 1.0)                 // B->BR
+        ((hue - 240.0) / 120.0, 0.0, 1.0)       // B->BR
     };
-
-    let rr = (r * v * 255.0).round() as u8;
-    let gg = (g * v * 255.0).round() as u8;
-    let bb = (b * v * 255.0).round() as u8;
-    (rr, gg, bb)
+    ((r * v * 255.0).round() as u8, (g * v * 255.0).round() as u8, (b * v * 255.0).round() as u8)
 }
 
 fn bands_to_hue(rb: f32, gm: f32, bt: f32) -> f32 {
