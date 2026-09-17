@@ -1,50 +1,33 @@
 mod config;
-mod shelly;
-mod govee;
+mod devices;
 
 use crate::config::AudioDeviceSelector;
+use crate::devices::{Device as LightDevice, Frame};
 use anyhow::{anyhow, Context, Result};
 use rustfft::{num_complex::Complex32, FftPlanner};
 use std::{ sync::{mpsc, Arc, atomic::{AtomicBool, Ordering}}, thread, time::{Duration, Instant} };
+use std::slice::from_raw_parts;
 use wasapi::{initialize_mta, Device, DeviceEnumerator, Direction, StreamMode};
 
 #[derive(Clone, Copy, Debug)]
 struct RgbwGain { r: u8, g: u8, b: u8, w: u8, overall: f32, transition_ms: u16, force: bool }
 
-enum RuntimeDevice {
-    Shelly {
-        cfg: config::ShellyConfig,
-        ctrl: Arc<shelly::ShellyController>,
-        initial: Option<shelly::ShellyRgbwState>,
-    },
-    Govee {
-        cfg: config::GoveeLanConfig,
-        initial: Option<govee::GoveeState>,
-    },
+impl RgbwGain {
+    fn to_frame(self) -> Frame {
+        Frame { r: self.r, g: self.g, b: self.b, w: self.w, overall: self.overall, transition_ms: self.transition_ms as u32 }
+    }
 }
 
 fn main() -> Result<()> {
     let cfg = config::load_or_create("config.json")?;
 
-    let mut runtime: Vec<RuntimeDevice> = Vec::new();
-
-    let has_govee = cfg.devices.iter().any(|d| matches!(d, config::DeviceConfig::GoveeLan(_)));
-    let govee_client = if has_govee { Some(Arc::new(govee::GoveeLan::new()?)) } else { None };
-
-    for dev in &cfg.devices {
-        match dev {
-            config::DeviceConfig::Shelly(sc) => {
-                let ctrl = Arc::new(shelly::ShellyController::new(sc)?);
-                let initial = ctrl.get_state().ok();
-                runtime.push(RuntimeDevice::Shelly { cfg: sc.clone(), ctrl, initial });
-            }
-            config::DeviceConfig::GoveeLan(gc) => {
-                runtime.push(RuntimeDevice::Govee { cfg: gc.clone(), initial: govee_client.as_ref().and_then(|c| c.get_state(&gc.ip).ok()) });
-            }
-        }
+    let runtime: Arc<Vec<Box<dyn LightDevice>>> = Arc::new(devices::build_all(&cfg.devices)?);
+    if runtime.is_empty() {
+        eprintln!("Warn: no devices configured, nothing will be controlled.");
     }
-
-    let runtime = Arc::new(runtime);
+    for dev in runtime.iter() {
+        eprintln!("Device: {}", dev.name());
+    }
 
     let min_send_interval = Duration::from_millis(cfg.change_interval_ms);
     let transition_min = cfg.transition_min_ms as f32;
@@ -59,10 +42,8 @@ fn main() -> Result<()> {
     let old_hook = std::panic::take_hook();
     {
         let runtime = Arc::clone(&runtime);
-        let govee_client_for_panic = govee_client.clone();
-
         std::panic::set_hook(Box::new(move |info| {
-            restore_last_state(&runtime, &govee_client_for_panic);
+            restore_last_state(&runtime);
             old_hook(info);
         }));
     }
@@ -76,7 +57,6 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel::<RgbwGain>();
     let _sender_thread = {
         let runtime = Arc::clone(&runtime);
-        let govee_client_for_sender = govee_client.clone();
 
         thread::spawn(move || {
             let mut last_sent = Instant::now() - min_send_interval;
@@ -89,28 +69,10 @@ fn main() -> Result<()> {
                 let changed = (v.r as i16 - last.r as i16).abs() > 3 || (v.g as i16 - last.g as i16).abs() > 3 || (v.b as i16 - last.b as i16).abs() > 3 || (v.overall - last.overall).abs() > 0.02;
                 if !changed && !v.force { continue; }
 
+                let frame = v.to_frame();
                 for dev in runtime.iter() {
-                    match dev {
-                        RuntimeDevice::Shelly { cfg, ctrl, .. } => {
-                            let minb = cfg.min_brightness.clamp(0, 100) as f32;
-                            let shaped = v.overall.clamp(0.0, 1.0).powf(cfg.brightness_gamma.clamp(0.1, 5.0));
-                            let mut bri = (minb + shaped * ((cfg.max_brightness.clamp(1, 100) as f32) - minb)).round() as u8;
-                            if bri == 0 { bri = 1; }
-                            let _ = ctrl.set_rgbw(v.r, v.g, v.b, v.w, bri, v.transition_ms as u32);
-                        }
-
-                        RuntimeDevice::Govee { cfg, .. } => {
-                            let Some(g) = govee_client_for_sender.as_ref() else { continue; };
-
-                            let minb = cfg.min_brightness.clamp(0, 100) as f32;
-                            let shaped = v.overall.clamp(0.0, 1.0).powf(cfg.brightness_gamma.clamp(0.1, 5.0));
-                            let mut bri = (minb + shaped * ((cfg.max_brightness.clamp(1, 100) as f32) - minb)).round() as u8;
-                            if bri == 0 { bri = 1; }
-
-                            let _ = g.turn(&cfg.ip, true);
-                            let _ = g.set_brightness(&cfg.ip, bri);
-                            let _ = g.set_rgb(&cfg.ip, v.r, v.g, v.b);
-                        }
+                    if let Err(e) = dev.apply(&frame) {
+                        eprintln!("{}: apply failed (ignored): {e:#}", dev.name());
                     }
                 }
 
@@ -294,23 +256,14 @@ fn main() -> Result<()> {
             }
         }
     }
-    restore_last_state(&runtime, &govee_client);
+    restore_last_state(&runtime);
     Ok(())
 }
 
-fn restore_last_state(runtime: &[RuntimeDevice], govee_client: &Option<Arc<govee::GoveeLan>>) {
+fn restore_last_state(runtime: &[Box<dyn LightDevice>]) {
     for dev in runtime.iter() {
-        match dev {
-            RuntimeDevice::Shelly { ctrl, initial, .. } => {
-                if let Some(st) = initial.clone() {
-                    let _ = ctrl.restore_state(st);
-                }
-            }
-            RuntimeDevice::Govee { cfg, initial } => {
-                if let (Some(g), Some(st)) = (govee_client.as_ref(), initial.clone()) {
-                    let _ = g.restore_state(&cfg.ip, st);
-                }
-            }
+        if let Err(e) = dev.restore() {
+            eprintln!("{}: restore failed (ignored): {e:#}", dev.name());
         }
     }
 }
@@ -320,7 +273,7 @@ fn cast_slice<T: Copy, U: Copy>(data: &[T]) -> &[U] {
     let byte_ptr = data.as_ptr() as *const U;
     let byte_len = size_of_val(data);
     let new_len = byte_len / size_of::<U>();
-    unsafe { std::slice::from_raw_parts(byte_ptr, new_len) }
+    unsafe { from_raw_parts(byte_ptr, new_len) }
 }
 
 fn list_render_devices(enumerator: &DeviceEnumerator) {
@@ -339,9 +292,7 @@ fn list_render_devices(enumerator: &DeviceEnumerator) {
 fn select_render_device(enumerator: &DeviceEnumerator, sel: &AudioDeviceSelector) -> Result<Device> {
     match sel {
         AudioDeviceSelector::Default => Ok(enumerator.get_default_device(&Direction::Render)?),
-
         AudioDeviceSelector::Id { id } => Ok(enumerator.get_device(id)?),
-
         AudioDeviceSelector::Name { name } => {
             let coll = enumerator.get_device_collection(&Direction::Render)?;
             for dev_res in &coll {
