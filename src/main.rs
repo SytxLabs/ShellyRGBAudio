@@ -1,37 +1,62 @@
+mod analysis;
+mod audio;
+mod color;
 mod config;
 mod devices;
 
+use crate::analysis::{Analysis, Analyzer};
+use crate::color::{ColorEngine, Rgbw};
 use crate::config::AudioDeviceSelector;
-use crate::devices::{Device as LightDevice, Frame};
+use crate::devices::{BrightnessLimits, Frame, RuntimeDevice};
 use anyhow::{anyhow, Context, Result};
-use rustfft::{num_complex::Complex32, FftPlanner};
-use std::{ sync::{mpsc, Arc, atomic::{AtomicBool, Ordering}}, thread, time::{Duration, Instant} };
-use std::slice::from_raw_parts;
-use wasapi::{initialize_mta, Device, DeviceEnumerator, Direction, StreamMode};
+use std::{
+    env,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+use wasapi::{initialize_mta, DeviceEnumerator, Direction, StreamMode};
 
-#[derive(Clone, Copy, Debug)]
-struct RgbwGain { r: u8, g: u8, b: u8, w: u8, overall: f32, transition_ms: u16, force: bool }
-
-impl RgbwGain {
-    fn to_frame(self) -> Frame {
-        Frame { r: self.r, g: self.g, b: self.b, w: self.w, overall: self.overall, transition_ms: self.transition_ms as u32 }
-    }
+enum Msg {
+    Sound(Analysis),
+    Silence,
 }
 
 fn main() -> Result<()> {
-    let cfg = config::load_or_create("config.json")?;
+    let path = env::args()
+        .nth(1)
+        .or_else(|| env::var("SHELLYRGBAUDIO_CONFIG").ok())
+        .unwrap_or_else(|| "config.json".to_string());
+    let cfg = config::load_or_create(&path)?;
 
-    let runtime: Arc<Vec<Box<dyn LightDevice>>> = Arc::new(devices::build_all(&cfg.devices)?);
+    let mut warnings = Vec::new();
+    let bands = color::validate_bands(&cfg.bands, &mut warnings);
+    let global_engine = Arc::new(ColorEngine::new(&bands, &cfg.color_map, &mut warnings));
+
+    devices::set_brightness_limits(BrightnessLimits {
+        floor: cfg.output.brightness_floor,
+        gamma_min: cfg.output.gamma_min,
+        gamma_max: cfg.output.gamma_max,
+    });
+
+    let runtime: Arc<Vec<RuntimeDevice>> = Arc::new(devices::build_all(&cfg.devices, &bands, &cfg.color_map, &mut warnings)?);
+    for w in &warnings {
+        eprintln!("Config: {w}");
+    }
     if runtime.is_empty() {
         eprintln!("Warn: no devices configured, nothing will be controlled.");
     }
     for dev in runtime.iter() {
-        eprintln!("Device: {}", dev.name());
+        let engine = dev.engine.as_deref().unwrap_or(&global_engine);
+        eprintln!("Device: {}{}", dev.name(), if dev.engine.is_some() { " (own color map)" } else { "" });
+        eprintln!("  {}", describe_bands(&bands, engine));
     }
-
-    let min_send_interval = Duration::from_millis(cfg.change_interval_ms);
-    let transition_min = cfg.transition_min_ms as f32;
-    let transition_max = cfg.transition_max_ms as f32;
+    if runtime.is_empty() {
+        eprintln!("Color map: {}", describe_bands(&bands, &global_engine));
+    }
 
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -48,124 +73,68 @@ fn main() -> Result<()> {
         }));
     }
 
-
-    let mut dimmed_due_to_silence = false;
-    let mut last_color: (u8, u8, u8, u8) = (255, 0, 0, 0);
-
-    let fft_size: usize = 1024;
-
-    let (tx, rx) = mpsc::channel::<RgbwGain>();
-    let _sender_thread = {
-        let runtime = Arc::clone(&runtime);
-
-        thread::spawn(move || {
-            let mut last_sent = Instant::now() - min_send_interval;
-            let mut last = RgbwGain { r: 0, g: 0, b: 0, w: 0, overall: 0.0, transition_ms: 0, force: false };
-
-            while let Ok(mut v) = rx.recv() {
-                while let Ok(newer) = rx.try_recv() { v = newer; }
-
-                if last_sent.elapsed() < min_send_interval { continue; }
-                let changed = (v.r as i16 - last.r as i16).abs() > 3 || (v.g as i16 - last.g as i16).abs() > 3 || (v.b as i16 - last.b as i16).abs() > 3 || (v.overall - last.overall).abs() > 0.02;
-                if !changed && !v.force { continue; }
-
-                let frame = v.to_frame();
-                for dev in runtime.iter() {
-                    if let Err(e) = dev.apply(&frame) {
-                        eprintln!("{}: apply failed (ignored): {e:#}", dev.name());
-                    }
-                }
-
-                last = v;
-                last_sent = Instant::now();
-            }
-        })
-    };
-
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let _sender_thread = spawn_sender(Arc::clone(&runtime), Arc::clone(&global_engine), &cfg, bands.len(), rx);
 
     initialize_mta().ok().context("initialize_mta failed (COM init; avoid calling from STA UI thread)")?;
 
     let enumerator = DeviceEnumerator::new()?;
-    let audio_err: Option<anyhow::Error> = match &cfg.audio_device {
-        AudioDeviceSelector::Id { id } => {
-            if id.is_empty() {
-                eprintln!("Warn: audio device ID is empty, using default device instead.");
-                list_render_devices(&enumerator);
-                Some(anyhow!("Audio device ID must not be empty"))
-            } else {
-                None
-            }
+    let audio_err: Option<anyhow::Error> = match &cfg.audio.device {
+        AudioDeviceSelector::Id { id } if id.is_empty() => {
+            eprintln!("Warn: audio device ID is empty, using default device instead.");
+            audio::list_render_devices(&enumerator);
+            Some(anyhow!("Audio device ID must not be empty"))
         }
-        AudioDeviceSelector::Name { name } => {
-            if name.is_empty() {
-                eprintln!("Warn: audio device name is empty, using default device instead.");
-                list_render_devices(&enumerator);
-                Some(anyhow!("Audio device name must not be empty"))
-            } else {
-                None
-            }
+        AudioDeviceSelector::Name { name } if name.is_empty() => {
+            eprintln!("Warn: audio device name is empty, using default device instead.");
+            audio::list_render_devices(&enumerator);
+            Some(anyhow!("Audio device name must not be empty"))
         }
-        _ => None
+        _ => None,
     };
     if let Some(e) = audio_err {
         eprintln!("{e:#}");
         return Ok(());
     }
-    let device = match select_render_device(&enumerator, &cfg.audio_device) {
+
+    let device = match audio::select_render_device(&enumerator, &cfg.audio.device) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Audio device selection failed: {e:#}");
-            list_render_devices(&enumerator);
+            audio::list_render_devices(&enumerator);
             return Err(e);
         }
     };
     let mut audio_client = device.get_iaudioclient()?;
     let desired_format = audio_client.get_mixformat()?;
 
-    let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: 200_000 };
+    let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: cfg.audio.buffer_duration_hns as _ };
     audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
     let capture = audio_client.get_audiocaptureclient()?;
     let event = audio_client.set_get_eventhandle()?;
     audio_client.start_stream()?;
 
-    // ---- FFT planner ----
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(fft_size);
-
     let channels = desired_format.get_nchannels() as usize;
     let bytes_per_frame = channels * size_of::<f32>();
+    let sample_rate = desired_format.get_samplespersec().max(1) as f32;
 
-    let mut mono_ring: Vec<f32> = Vec::with_capacity(fft_size);
-    let mut fft_buf: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); fft_size];
+    let mut warnings = Vec::new();
+    let mut analyzer = Analyzer::new(&cfg.audio, &bands, &cfg.dynamics, &cfg.output, sample_rate, &mut warnings);
+    for w in &warnings {
+        eprintln!("Audio: {w}");
+    }
 
-    let mut bass_peak = 1e-6f32;
-    let mut mid_peak = 1e-6f32;
-    let mut treble_peak = 1e-6f32;
-
-    let mut overall_ema: f32 = 0.0;
-    let mut flux_ema: f32 = 0.0;
-
-    let mut prev_bass: f32 = 0.0;
-    let mut prev_mid: f32 = 0.0;
-    let mut prev_treble: f32 = 0.0;
-
-    let mut strobe_until: Option<Instant> = None;
-
-    // Tuning
-    let level_alpha: f32 = 0.12;  // Overall level smoothing (smaller = less, bigger = react)
-    let flux_alpha: f32  = 0.25;  // Beat smoothing
-    let beat_threshold: f32 = cfg.beat_threshold;
-    let strobe_ms: u64 = cfg.strobe_ms;
+    let silence_timeout = cfg.audio.silence_timeout_ms.min(u32::MAX as u64) as u32;
+    let mut dimmed_due_to_silence = false;
 
     loop {
         if !running.load(Ordering::SeqCst) {
             break;
         }
 
-        if let Err(_) = event.wait_for_event(2000) {
+        if event.wait_for_event(silence_timeout).is_err() {
             if !dimmed_due_to_silence {
-                let (r, g, b, w) = last_color;
-                let _ = tx.send(RgbwGain { r, g, b, w, overall: 0.0, transition_ms: 800, force: true});
+                let _ = tx.send(Msg::Silence);
                 dimmed_due_to_silence = true;
             }
             continue;
@@ -182,147 +151,97 @@ fn main() -> Result<()> {
                 break;
             }
 
-            let floats: &[f32] = cast_slice(&raw);
+            let floats: &[f32] = audio::cast_slice(&raw);
             for frame in floats.chunks_exact(channels) {
-                let mono = if frame.len() == 1 { frame[0] } else { (frame[0] + frame[1]) * 0.5 };
-
-                mono_ring.push(mono);
-                if mono_ring.len() >= fft_size {
-                    for i in 0..fft_size {
-                        let w = 0.5 - 0.5 * ((2.0 * std::f32::consts::PI * i as f32) / (fft_size as f32)).cos();
-                        fft_buf[i] = Complex32::new(mono_ring[i] * w, 0.0);
-                    }
-                    mono_ring.clear();
-                    fft.process(&mut fft_buf);
-
-                    let sr = desired_format.get_samplespersec().max(1) as f32;
-                    let mut bass = 0.0f32;
-                    let mut mid = 0.0f32;
-                    let mut treble = 0.0f32;
-
-                    let half = fft_size / 2;
-                    for bin in 1..half {
-                        let freq = (bin as f32) * sr / (fft_size as f32);
-                        let mag2 = fft_buf[bin].norm_sqr();
-
-                        if (20.0..200.0).contains(&freq) {
-                            bass += mag2;
-                        } else if (200.0..2000.0).contains(&freq) {
-                            mid += mag2;
-                        } else if (2000.0..8000.0).contains(&freq) {
-                            treble += mag2;
-                        }
-                    }
-
-                    bass = (bass + 1.0).ln();
-                    mid = (mid + 1.0).ln();
-                    treble = (treble + 1.0).ln();
-
-                    bass_peak = bass_peak.max(bass) * 0.995;
-                    mid_peak = mid_peak.max(mid) * 0.995;
-                    treble_peak = treble_peak.max(treble) * 0.995;
-
-                    let rb = (bass / bass_peak).clamp(0.0, 1.0);
-                    let gm = (mid / mid_peak).clamp(0.0, 1.0);
-                    let bt = (treble / treble_peak).clamp(0.0, 1.0);
-
-                    let flux = ((rb - prev_bass).max(0.0) + (gm - prev_mid).max(0.0) + (bt - prev_treble).max(0.0)).clamp(0.0, 3.0) / 3.0;
-                    prev_bass = rb;
-                    prev_mid = gm;
-                    prev_treble = bt;
-                    flux_ema += flux_alpha * (flux - flux_ema);
-
-                    // Brightness from overall energy
-                    let overall = ((rb + gm + bt) / 3.0).clamp(0.0, 1.0);
-                    overall_ema += level_alpha * (overall - overall_ema);
-                    let now = Instant::now();
-
-                    if flux_ema > beat_threshold { strobe_until = Some(now + Duration::from_millis(strobe_ms)); }
-                    let strobing = strobe_until.map(|t| now < t).unwrap_or(false);
-                    let beat_strength = ((flux_ema - beat_threshold) / (1.0 - beat_threshold)).clamp(0.0, 1.0);
-                    let mix = (0.75 * beat_strength + 0.25 * overall_ema).clamp(0.0, 1.0);
-                    let transition_f = transition_max - mix * (transition_max - transition_min);
-                    let transition_ms = transition_f.round().clamp(0.0, u16::MAX as f32) as u16;
-
-                    let overall = if strobing { 1.0 } else { overall_ema };
-                    let (r, g, b) = hue_to_two_channel_rgb(bands_to_hue(rb, gm, bt), (0.15 + 0.85 * overall).clamp(0.0, 1.0));
-
-                    if bass != 0.0 && mid != 0.0 && treble != 0.0 {
-                        dimmed_due_to_silence = false;
-                        last_color = (r, g, b, 0);
-                    }
-                    let _ = tx.send(RgbwGain { r, g, b, w: 0, overall, transition_ms, force: false});
+                let Some(result) = analyzer.push(audio::downmix(frame, cfg.audio.downmix)) else { continue };
+                if result.has_signal {
+                    dimmed_due_to_silence = false;
                 }
+                let _ = tx.send(Msg::Sound(result));
             }
         }
     }
+
     restore_last_state(&runtime);
     Ok(())
 }
 
-fn restore_last_state(runtime: &[Box<dyn LightDevice>]) {
+/// Throttles, deduplicates and fans out to the lights. Each device keeps its own last frame, because two devices with different color maps legitimately differ on the same analysis.
+fn spawn_sender(runtime: Arc<Vec<RuntimeDevice>>, global: Arc<ColorEngine>, cfg: &config::AppConfig, band_count: usize, rx: mpsc::Receiver<Msg>) -> thread::JoinHandle<()> {
+    let min_send_interval = Duration::from_millis(cfg.output.change_interval_ms);
+    let deadband_rgb = cfg.output.deadband_rgb as i16;
+    let deadband_overall = cfg.output.deadband_overall;
+    let strobe_color = cfg.dynamics.strobe_color;
+    let silence_brightness = cfg.audio.silence_brightness.clamp(0.0, 1.0);
+    let silence_fade_ms = cfg.audio.silence_fade_ms;
+
+    thread::spawn(move || {
+        let quiet = vec![0.0f32; band_count];
+        let initial: Vec<Frame> = runtime.iter().map(|dev| {
+            to_frame(dev.engine.as_deref().unwrap_or(&global).resolve(&quiet, silence_brightness), silence_brightness, silence_fade_ms)
+        }).collect();
+
+        let mut last: Vec<Option<Frame>> = vec![None; runtime.len()];
+        let mut last_sent = Instant::now() - min_send_interval;
+
+        while let Ok(mut msg) = rx.recv() {
+            while let Ok(newer) = rx.try_recv() {
+                msg = newer;
+            }
+            if last_sent.elapsed() < min_send_interval {
+                continue;
+            }
+
+            let mut sent_any = false;
+            for (i, dev) in runtime.iter().enumerate() {
+                let (frame, force) = match &msg {
+                    Msg::Sound(a) => {
+                        let mut color = dev.engine.as_deref().unwrap_or(&global).resolve(&a.bands, a.overall);
+                        if a.strobing && let Some(c) = strobe_color {
+                            color = c;
+                        }
+                        (to_frame(color, a.overall, a.transition_ms), a.force)
+                    }
+                    Msg::Silence => {
+                        let base = last[i].unwrap_or(initial[i]);
+                        (Frame { overall: silence_brightness, transition_ms: silence_fade_ms, ..base }, true)
+                    }
+                };
+
+                if !force && !changed(&frame, last[i].as_ref(), deadband_rgb, deadband_overall) {
+                    continue;
+                }
+                if let Err(e) = dev.apply(&frame) {
+                    eprintln!("{}: apply failed (ignored): {e:#}", dev.name());
+                }
+                last[i] = Some(frame);
+                sent_any = true;
+            }
+
+            if sent_any {
+                last_sent = Instant::now();
+            }
+        }
+    })
+}
+
+fn describe_bands(bands: &[color::BandConfig], engine: &ColorEngine) -> String {
+    bands.iter().zip(engine.band_colors()).zip(engine.band_weights())
+        .map(|((b, c), w)| format!("{} {:.0}-{:.0}Hz {}{}", b.name, b.from_hz, b.to_hz, c.to_hex(), if *w == 1.0 { String::new() } else { format!(" x{w}") }))
+        .collect::<Vec<_>>().join(", ")
+}
+fn to_frame(c: Rgbw, overall: f32, transition_ms: u32) -> Frame {
+    Frame { r: c.r, g: c.g, b: c.b, w: c.w, overall, transition_ms }
+}
+fn changed(next: &Frame, last: Option<&Frame>, deadband_rgb: i16, deadband_overall: f32) -> bool {
+    let Some(prev) = last else { return true };
+    let d = |a: u8, b: u8| (a as i16 - b as i16).abs() > deadband_rgb;
+    d(next.r, prev.r) || d(next.g, prev.g) || d(next.b, prev.b) || d(next.w, prev.w) || (next.overall - prev.overall).abs() > deadband_overall
+}
+fn restore_last_state(runtime: &[RuntimeDevice]) {
     for dev in runtime.iter() {
         if let Err(e) = dev.restore() {
             eprintln!("{}: restore failed (ignored): {e:#}", dev.name());
         }
     }
-}
-
-
-fn cast_slice<T: Copy, U: Copy>(data: &[T]) -> &[U] {
-    let byte_ptr = data.as_ptr() as *const U;
-    let byte_len = size_of_val(data);
-    let new_len = byte_len / size_of::<U>();
-    unsafe { from_raw_parts(byte_ptr, new_len) }
-}
-
-fn list_render_devices(enumerator: &DeviceEnumerator) {
-    if let Ok(coll) = enumerator.get_device_collection(&Direction::Render) {
-        eprintln!("--- Render devices (Output) ---");
-        for dev_res in &coll {
-            if let Ok(dev) = dev_res {
-                let name = dev.get_friendlyname().unwrap_or_else(|_| "<no name>".to_string());
-                let id = dev.get_id().unwrap_or_else(|_| "<no id>".to_string());
-                eprintln!("  - {name}\n    id: {id}");
-            }
-        }
-    }
-}
-
-fn select_render_device(enumerator: &DeviceEnumerator, sel: &AudioDeviceSelector) -> Result<Device> {
-    match sel {
-        AudioDeviceSelector::Default => Ok(enumerator.get_default_device(&Direction::Render)?),
-        AudioDeviceSelector::Id { id } => Ok(enumerator.get_device(id)?),
-        AudioDeviceSelector::Name { name } => {
-            let coll = enumerator.get_device_collection(&Direction::Render)?;
-            for dev_res in &coll {
-                let dev = dev_res?;
-                let f_name = dev.get_friendlyname().unwrap_or_default();
-                if f_name.to_lowercase().contains(&name.to_lowercase()) {
-                    return Ok(dev);
-                }
-            }
-            anyhow::bail!("Audio device not found by name: {name}");
-        }
-    }
-}
-
-fn hue_to_two_channel_rgb(hue_deg: f32, value: f32) -> (u8, u8, u8) {
-    let hue = hue_deg.rem_euclid(360.0);
-    let v = value.clamp(0.0, 1.0);
-
-    let (r, g, b) = if hue < 120.0 {
-        (1.0, hue / 120.0, 0.0)                 // R->RG
-    } else if hue < 240.0 {
-        (0.0, 1.0, (hue - 120.0) / 120.0)       // G->GB
-    } else {
-        ((hue - 240.0) / 120.0, 0.0, 1.0)       // B->BR
-    };
-    ((r * v * 255.0).round() as u8, (g * v * 255.0).round() as u8, (b * v * 255.0).round() as u8)
-}
-
-fn bands_to_hue(rb: f32, gm: f32, bt: f32) -> f32 {
-    let mut hue = ((3.0_f32.sqrt() / 2.0) * (gm - bt)).atan2(rb - 0.5 * (gm + bt)) * 180.0 / std::f32::consts::PI;
-    if hue < 0.0 { hue += 360.0; }
-    hue
 }

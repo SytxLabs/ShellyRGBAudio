@@ -20,6 +20,7 @@ pub const DESCRIPTOR: DeviceDescriptor = DeviceDescriptor {
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShellyConfig {
     pub host: String,
     pub device: ShellyModel,
@@ -28,6 +29,9 @@ pub struct ShellyConfig {
     pub brightness_gamma: f32,
     pub rgbw_id: u8,
     pub auth: Option<ShellyAuth>,
+    pub http_timeout_ms: u64,
+    pub gen2_min_transition_ms: u64,
+    pub gen2_max_transition_s: f64,
 }
 
 impl Default for ShellyConfig {
@@ -40,6 +44,9 @@ impl Default for ShellyConfig {
             brightness_gamma: 0.6,
             rgbw_id: 0,
             auth: None,
+            http_timeout_ms: 3000,
+            gen2_min_transition_ms: 500,
+            gen2_max_transition_s: 10600.0,
         }
     }
 }
@@ -103,6 +110,8 @@ pub struct ShellyController {
     rgbw_id: u8,
     auth: Option<ShellyAuth>, // OWNED strings => no lifetime issues
     max_brightness: u8,
+    gen2_min_transition_s: f64,
+    gen2_max_transition_s: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,14 +126,23 @@ pub struct ShellyRgbwState {
 
 impl ShellyController {
     pub fn new(cfg: &ShellyConfig) -> Result<Self> {
-        let http = Client::builder().timeout(Duration::from_secs(3)).build().context("build request client")?;
+        let http = Client::builder().timeout(Duration::from_millis(cfg.http_timeout_ms.max(1))).build().context("build request client")?;
         let base = normalize_base(&cfg.host);
         let api = match cfg.device {
             ShellyModel::Rgbw2 => ApiGen::Gen1,
             ShellyModel::PlusRgbwPm => ApiGen::Gen2,
             ShellyModel::Auto => detect_api(&http, &base)?,
         };
-        Ok(Self { http, base, api, rgbw_id: cfg.rgbw_id, auth: cfg.auth.clone(), max_brightness: cfg.max_brightness})
+        Ok(Self {
+            http,
+            base,
+            api,
+            rgbw_id: cfg.rgbw_id,
+            auth: cfg.auth.clone(),
+            max_brightness: cfg.max_brightness,
+            gen2_min_transition_s: cfg.gen2_min_transition_ms as f64 / 1000.0,
+            gen2_max_transition_s: cfg.gen2_max_transition_s,
+        })
     }
 
     pub fn get_state(&self) -> Result<ShellyRgbwState> {
@@ -178,10 +196,7 @@ impl ShellyController {
     // -------- Gen2: Shelly Plus RGBW PM (RGBW.Set over JSON-RPC) --------
     fn set_gen2_rgbw(&self, r: u8, g: u8, b: u8, w: u8, brightness_0_100: u8, transition_ms: u32, ) -> Result<()> {
         let brightness = brightness_0_100.clamp(1, self.max_brightness) as u32;
-        let mut transition_s = (transition_ms as f64) / 1000.0;
-        if transition_s > 10700.0 {
-            transition_s = 10600.0;
-        }
+        let transition_s = ((transition_ms as f64) / 1000.0).min(self.gen2_max_transition_s);
 
         let mut params = json!({
             "id": self.rgbw_id,
@@ -191,7 +206,7 @@ impl ShellyController {
             "white": w
         });
 
-        if transition_s >= 0.5 {
+        if transition_s >= self.gen2_min_transition_s {
             params["transition_duration"] = json!(transition_s);
         }
         let _result = self.rpc_call("RGBW.Set", params)?;
@@ -308,7 +323,7 @@ impl ShellyController {
 
         Ok(ShellyRgbwState {
             on: result.get("output").and_then(|x| x.as_bool()).unwrap_or(false),
-            r: *rgb.get(0).unwrap_or(&0),
+            r: *rgb.first().unwrap_or(&0),
             g: *rgb.get(1).unwrap_or(&0),
             b: *rgb.get(2).unwrap_or(&0),
             w: result.get("white").and_then(|x| x.as_u64()).unwrap_or(0).min(255) as u8,
@@ -320,7 +335,7 @@ impl ShellyController {
         let params = json!({
             "id": self.rgbw_id,
             "on": s.on,
-            "brightness": s.brightness.max(1).min(100) as u32,
+            "brightness": s.brightness.clamp(1, 100) as u32,
             "rgb": [s.r, s.g, s.b],
             "white": s.w
         });

@@ -1,59 +1,268 @@
-use anyhow::{Context, Result};
+﻿use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fs, path::Path};
 
+use crate::color::{default_bands, BandConfig, ColorMapConfig, Rgbw};
 use crate::devices;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub change_interval_ms: u64,
-    pub audio_device: AudioDeviceSelector,
-    pub transition_min_ms: u64,
-    pub transition_max_ms: u64,
-    pub beat_threshold: f32,
-    pub strobe_ms: u64,
-
-    /// Raw device entries. Each one is dispatched by its `type` field to the matching device in `src/devices/`, which owns its own config schema.
+    #[serde(default)]
+    pub audio: AudioSection,
+    #[serde(default = "default_bands")]
+    pub bands: Vec<BandConfig>,
+    #[serde(default)]
+    pub color_map: ColorMapConfig,
+    #[serde(default)]
+    pub dynamics: DynamicsSection,
+    #[serde(default)]
+    pub output: OutputSection,
+    #[serde(default = "devices::default_entries")]
     pub devices: Vec<Value>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            change_interval_ms: 120,
-            audio_device: AudioDeviceSelector::Default,
-            transition_min_ms: 60,
-            transition_max_ms: 600,
-            beat_threshold: 0.18,
-            strobe_ms: 40,
-
+            audio: AudioSection::default(),
+            bands: default_bands(),
+            color_map: ColorMapConfig::default(),
+            dynamics: DynamicsSection::default(),
+            output: OutputSection::default(),
             devices: devices::default_entries(),
         }
     }
 }
 
+// ---------------------------------------------------------------- audio
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowKind {
+    #[default]
+    Hann,
+    Hamming,
+    Blackman,
+    Rectangular,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Downmix {
+    #[default]
+    Average,
+    Left,
+    Right,
+    AllChannels,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioSection {
+    #[serde(default)]
+    pub device: AudioDeviceSelector,
+    #[serde(default = "d_fft_size")]
+    pub fft_size: usize,
+    #[serde(default = "d_fft_size")]
+    pub hop_size: usize,
+    #[serde(default)]
+    pub window: WindowKind,
+    #[serde(default)]
+    pub downmix: Downmix,
+    #[serde(default = "d_buffer_hns")]
+    pub buffer_duration_hns: i64, // WASAPI capture buffer in 100 ns units. 200,000 is 20 ms.
+    #[serde(default = "d_silence_timeout")]
+    pub silence_timeout_ms: u64, // No audio for this long counts as silence.
+    #[serde(default = "d_silence_fade")]
+    pub silence_fade_ms: u32, // Fade time used when dimming down into silence.
+    #[serde(default)]
+    pub silence_brightness: f32, // Brightness held during silence, `0.0` to `1.0`.
+}
+
+fn d_fft_size() -> usize { 1024 }
+fn d_buffer_hns() -> i64 { 200_000 }
+fn d_silence_timeout() -> u64 { 2000 }
+fn d_silence_fade() -> u32 { 800 }
+
+impl Default for AudioSection {
+    fn default() -> Self {
+        Self {
+            device: AudioDeviceSelector::Default,
+            fft_size: d_fft_size(),
+            hop_size: d_fft_size(),
+            window: WindowKind::default(),
+            downmix: Downmix::default(),
+            buffer_duration_hns: d_buffer_hns(),
+            silence_timeout_ms: d_silence_timeout(),
+            silence_fade_ms: d_silence_fade(),
+            silence_brightness: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AudioDeviceSelector {
+    #[default]
     Default,
     Id { id: String },
     Name { name: String },
 }
 
+// ---------------------------------------------------------------- dynamics
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Normalize {
+    #[default]
+    Shared,
+    PerBand,
+}
+
+/// Where the brightness level comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LevelSource {
+    #[default]
+    Peak,
+    Average,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicsSection {
+    #[serde(default)]
+    pub normalize: Normalize,
+    #[serde(default)]
+    pub level_source: LevelSource,
+    
+    #[serde(default = "d_one")]
+    pub log_offset: f32, // Offset in the `ln(x + offset)` loudness compression. Larger values flatten quiet passages.
+    #[serde(default = "d_peak_floor")]
+    pub peak_floor: f32, // Lower bound of the per-band peak tracker. Also acts as the noise floor.
+    #[serde(default = "d_peak_decay")]
+    pub peak_decay: f32, // Per-frame decay of the per-band peak tracker. Closer to 1 adapts more slowly.
+    #[serde(default = "d_level_alpha")]
+    pub level_alpha: f32, // Smoothing of the overall level. Smaller reacts less, larger reacts faster.
+    #[serde(default = "d_band_attack")]
+    pub band_attack: f32, // How fast a band's energy is allowed to *rise*. This is what decides how quickly the color answers the music, so keep it high. `1.0` follows every frame instantly.
+    
+    #[serde(default = "d_band_release")]
+    pub band_release: f32, // How fast a band's energy is allowed to *fall*. Lower values make the color glide instead of flickering, without costing any responsibility, because rises are governed by `band_attack`. Beat detection uses the unsmoothed values either way, so neither knob dulls the strobe.
+    #[serde(default = "d_flux_alpha")]
+    pub flux_alpha: f32, // Smoothing of the spectral flux used for beat detection.
+    #[serde(default = "d_beat_threshold")]
+    pub beat_threshold: f32,
+    #[serde(default)]
+    pub beat_cooldown_ms: u64, // Minimum time between two beats. `0` keeps the old behavior where every frame above the threshold retriggers.
+    
+    #[serde(default = "d_strobe_ms")]
+    pub strobe_ms: u64, // How long a beat holds the strobe.
+    #[serde(default = "d_one")]
+    pub strobe_level: f32, // Brightness during a strobe, `0.0` to `1.0`.
+    #[serde(default)]
+    pub strobe_color: Option<Rgbw>, // Color forced during a strobe. `null` keeps the music color.
+}
+
+fn d_one() -> f32 { 1.0 }
+fn d_peak_floor() -> f32 { 1e-6 }
+fn d_peak_decay() -> f32 { 0.995 }
+fn d_level_alpha() -> f32 { 0.12 }
+pub(crate) fn d_band_attack() -> f32 { 0.45 }
+pub(crate) fn d_band_release() -> f32 { 0.12 }
+fn d_flux_alpha() -> f32 { 0.25 }
+fn d_beat_threshold() -> f32 { 0.18 }
+fn d_strobe_ms() -> u64 { 40 }
+
+impl Default for DynamicsSection {
+    fn default() -> Self {
+        Self {
+            normalize: Normalize::default(),
+            level_source: LevelSource::default(),
+            log_offset: d_one(),
+            peak_floor: d_peak_floor(),
+            peak_decay: d_peak_decay(),
+            level_alpha: d_level_alpha(),
+            band_attack: d_band_attack(),
+            band_release: d_band_release(),
+            flux_alpha: d_flux_alpha(),
+            beat_threshold: d_beat_threshold(),
+            beat_cooldown_ms: 0,
+            strobe_ms: d_strobe_ms(),
+            strobe_level: d_one(),
+            strobe_color: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- output
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputSection {
+    #[serde(default = "d_change_interval")]
+    pub change_interval_ms: u64, // Minimum time between two commands sent to the lights. Lower reacts faster but stresses the device.
+    #[serde(default = "d_transition_min")]
+    pub transition_min_ms: u64,
+    #[serde(default = "d_transition_max")]
+    pub transition_max_ms: u64,
+    #[serde(default = "d_beat_weight")]
+    pub transition_beat_weight: f32, // How much beat strength shortens the transition.
+    #[serde(default = "d_level_weight")]
+    pub transition_level_weight: f32, // How much the overall level shortens the transition.
+    #[serde(default = "d_one")]
+    pub transition_curve: f32, // Shapes the transition ramp. `1.0` is linear, `> 1` keeps transitions long until the music really picks up.
+    #[serde(default = "d_deadband_rgb")]
+    pub deadband_rgb: u8, // A frame is only sent if a channel moved at least this much.
+    #[serde(default = "d_deadband_overall")]
+    pub deadband_overall: f32, // ... or the overall level moved at least this much.
+    #[serde(default = "d_brightness_floor")]
+    pub brightness_floor: u8, // Lowest brightness ever sent to a light. `1` keeps lights from switching off completely.
+    #[serde(default = "d_gamma_min")]
+    pub gamma_min: f32,
+    #[serde(default = "d_gamma_max")]
+    pub gamma_max: f32,
+}
+
+fn d_change_interval() -> u64 { 120 }
+fn d_transition_min() -> u64 { 60 }
+fn d_transition_max() -> u64 { 600 }
+fn d_beat_weight() -> f32 { 0.75 }
+fn d_level_weight() -> f32 { 0.25 }
+fn d_deadband_rgb() -> u8 { 3 }
+fn d_deadband_overall() -> f32 { 0.02 }
+fn d_brightness_floor() -> u8 { 1 }
+fn d_gamma_min() -> f32 { 0.1 }
+fn d_gamma_max() -> f32 { 5.0 }
+
+impl Default for OutputSection {
+    fn default() -> Self {
+        Self {
+            change_interval_ms: d_change_interval(),
+            transition_min_ms: d_transition_min(),
+            transition_max_ms: d_transition_max(),
+            transition_beat_weight: d_beat_weight(),
+            transition_level_weight: d_level_weight(),
+            transition_curve: d_one(),
+            deadband_rgb: d_deadband_rgb(),
+            deadband_overall: d_deadband_overall(),
+            brightness_floor: d_brightness_floor(),
+            gamma_min: d_gamma_min(),
+            gamma_max: d_gamma_max(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- loading
+
 fn merge_defaults(user: &mut Value, defaults: &Value) {
-    match (user, defaults) {
-        (Value::Object(u), Value::Object(d)) => {
-            for (k, dv) in d {
-                match u.get_mut(k) {
-                    Some(uv) => merge_defaults(uv, dv),
-                    None => {
-                        u.insert(k.clone(), dv.clone());
-                    }
+    if let (Value::Object(u), Value::Object(d)) = (user, defaults) {
+        for (k, dv) in d {
+            match u.get_mut(k) {
+                Some(uv) => merge_defaults(uv, dv),
+                None => {
+                    u.insert(k.clone(), dv.clone());
                 }
             }
         }
-        _ => {}
     }
 }
 
@@ -96,23 +305,58 @@ fn migrate_legacy_devices(merged: &mut Value) {
     }
 }
 
+fn migrate_legacy_top_level(merged: &mut Value) {
+    const MOVES: &[(&str, &str, &str)] = &[
+        ("audio_device", "audio", "device"),
+        ("change_interval_ms", "output", "change_interval_ms"),
+        ("transition_min_ms", "output", "transition_min_ms"),
+        ("transition_max_ms", "output", "transition_max_ms"),
+        ("beat_threshold", "dynamics", "beat_threshold"),
+        ("strobe_ms", "dynamics", "strobe_ms"),
+    ];
+
+    for (old_key, section, new_key) in MOVES {
+        let Some(obj) = merged.as_object_mut() else { return };
+        let Some(val) = obj.remove(*old_key) else { continue };
+
+        let entry = obj.entry((*section).to_string()).or_insert_with(|| Value::Object(Default::default()));
+        if let Some(sec) = entry.as_object_mut() && !sec.contains_key(*new_key)
+        {
+            sec.insert((*new_key).to_string(), val);
+        }
+    }
+    if let Some(dyn_sec) = merged.get_mut("dynamics").and_then(|v| v.as_object_mut()) && let Some(alpha) = dyn_sec.remove("band_alpha")
+    {
+        for key in ["band_attack", "band_release"] {
+            if !dyn_sec.contains_key(key) {
+                dyn_sec.insert(key.to_string(), alpha.clone());
+            }
+        }
+    }
+
+    if let Some(map) = merged.get_mut("color_map").and_then(|v| v.as_object_mut()) && let Some(Value::Bool(on)) = map.remove("saturate") && !map.contains_key("saturation")
+    {
+        map.insert("saturation".to_string(), serde_json::json!(if on { 1.0 } else { 0.0 }));
+    }
+}
+
 pub fn load_or_create(path: &str) -> Result<AppConfig> {
     let p = Path::new(path);
     let defaults_cfg = AppConfig::default();
     let defaults_val = serde_json::to_value(&defaults_cfg).context("serialize defaults")?;
 
     if !p.exists() {
-        write_pretty(path, &defaults_val)?;
+        write_pretty(path, &defaults_cfg)?;
         eprintln!("Created default {path}. Please adjust and restart (optional).");
         return Ok(defaults_cfg);
     }
 
     let raw = fs::read_to_string(p).with_context(|| format!("read {path}"))?;
-    let parsed_user: Value = match serde_json::from_str(&raw) {
+    let parsed_user: Value = match serde_json::from_str(raw.trim_start_matches('\u{feff}')) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Config JSON invalid ({path}): {e}. Replacing with defaults.");
-            write_pretty(path, &defaults_val)?;
+            replace_with_defaults(path, &raw, &defaults_cfg)?;
             return Ok(defaults_cfg);
         }
     };
@@ -124,6 +368,7 @@ pub fn load_or_create(path: &str) -> Result<AppConfig> {
         defaults_val.clone()
     };
 
+    migrate_legacy_top_level(&mut merged);
     migrate_legacy_devices(&mut merged);
     merge_defaults(&mut merged, &defaults_val);
 
@@ -131,15 +376,24 @@ pub fn load_or_create(path: &str) -> Result<AppConfig> {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Config has invalid values/types: {e}. Replacing with defaults.");
-            write_pretty(path, &defaults_val)?;
+            replace_with_defaults(path, &raw, &defaults_cfg)?;
             return Ok(defaults_cfg);
         }
     };
-    write_pretty(path, &merged)?;
+    write_pretty(path, &cfg)?;
     Ok(cfg)
 }
 
-fn write_pretty(path: &str, v: &Value) -> Result<()> {
+fn replace_with_defaults(path: &str, previous: &str, defaults: &AppConfig) -> Result<()> {
+    let backup = format!("{path}.bak");
+    match fs::write(&backup, previous) {
+        Ok(()) => eprintln!("Previous config saved to {backup}."),
+        Err(e) => eprintln!("Could not write {backup} (ignored): {e}"),
+    }
+    write_pretty(path, defaults)
+}
+
+fn write_pretty<T: Serialize>(path: &str, v: &T) -> Result<()> {
     let text = serde_json::to_string_pretty(v).context("to_string_pretty")?;
     fs::write(path, text).with_context(|| format!("write {path}"))?;
     Ok(())
