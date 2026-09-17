@@ -61,6 +61,8 @@ pub enum Downmix {
 pub struct AudioSection {
     #[serde(default)]
     pub device: AudioDeviceSelector,
+    #[serde(default)]
+    pub apps: AppsSection, // Per-application capture. While disabled, the whole `device` is captured as before.
     #[serde(default = "d_fft_size")]
     pub fft_size: usize,
     #[serde(default = "d_fft_size")]
@@ -88,6 +90,7 @@ impl Default for AudioSection {
     fn default() -> Self {
         Self {
             device: AudioDeviceSelector::Default,
+            apps: AppsSection::default(),
             fft_size: d_fft_size(),
             hop_size: d_fft_size(),
             window: WindowKind::default(),
@@ -107,6 +110,81 @@ pub enum AudioDeviceSelector {
     Default,
     Id { id: String },
     Name { name: String },
+}
+
+// ---------------------------------------------------------------- audio.apps
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppMatchMode {
+    #[default]
+    Include,
+    Exclude,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppsSection {
+    #[serde(default)]
+    pub enabled: bool, // `false` captures the output device, exactly like before.
+    #[serde(default)]
+    pub mode: AppMatchMode,
+    #[serde(default = "d_true")]
+    pub include_process_tree: bool, // Also capture a child process of a matched app, even when its executable has another name. Browsers play through a child process, so this keeps working when that child is named differently.
+    #[serde(default = "d_rescan")]
+    pub rescan_ms: u64, // How often the running applications are rechecked, so an app that starts, restarts or plays its first sound later is picked up.
+    #[serde(default = "d_app_rate")]
+    pub sample_rate: u32, // Capture format. Per-app capture cannot ask the system for a mix format, so it has to be stated.
+    #[serde(default = "d_app_channels")]
+    pub channels: u16,
+    #[serde(default)]
+    pub groups: Vec<AppGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppGroup {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub apps: Vec<String>, // Matched case insensitively against the display name ("Google Chrome") and the executable ("chrome.exe").
+    #[serde(default = "d_one")]
+    pub gain: f32,
+}
+
+fn d_true() -> bool { true }
+fn d_rescan() -> u64 { 3000 }
+fn d_app_rate() -> u32 { 48_000 }
+fn d_app_channels() -> u16 { 2 }
+
+impl Default for AppsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: AppMatchMode::default(),
+            include_process_tree: d_true(),
+            rescan_ms: d_rescan(),
+            sample_rate: d_app_rate(),
+            channels: d_app_channels(),
+            groups: Vec::new(),
+        }
+    }
+}
+
+impl AppsSection {
+    pub fn active_groups(&self) -> impl Iterator<Item = &AppGroup> {
+        self.groups.iter().filter(|g| g.enabled && g.apps.iter().any(|p| !p.trim().is_empty()))
+    }
+
+    pub fn is_usable(&self, warnings: &mut Vec<String>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.active_groups().next().is_none() {
+            warnings.push("audio.apps.enabled is true but no enabled group names an app, capturing the output device instead".to_string());
+            return false;
+        }
+        true
+    }
 }
 
 // ---------------------------------------------------------------- dynamics

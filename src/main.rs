@@ -1,24 +1,25 @@
 mod analysis;
 mod audio;
+mod capture;
 mod color;
 mod config;
 mod devices;
 
 use crate::analysis::{Analysis, Analyzer};
+use crate::capture::Capture;
 use crate::color::{ColorEngine, Rgbw};
-use crate::config::AudioDeviceSelector;
 use crate::devices::{BrightnessLimits, Frame, RuntimeDevice};
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use std::{
     env,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc::{self, RecvTimeoutError},
+        Arc,
     },
     thread,
     time::{Duration, Instant},
 };
-use wasapi::{initialize_mta, DeviceEnumerator, Direction, StreamMode};
 
 enum Msg {
     Sound(Analysis),
@@ -26,10 +27,7 @@ enum Msg {
 }
 
 fn main() -> Result<()> {
-    let path = env::args()
-        .nth(1)
-        .or_else(|| env::var("SHELLYRGBAUDIO_CONFIG").ok())
-        .unwrap_or_else(|| "config.json".to_string());
+    let Some(path) = parse_args()? else { return Ok(()) };
     let cfg = config::load_or_create(&path)?;
 
     let mut warnings = Vec::new();
@@ -76,94 +74,81 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let _sender_thread = spawn_sender(Arc::clone(&runtime), Arc::clone(&global_engine), &cfg, bands.len(), rx);
 
-    initialize_mta().ok().context("initialize_mta failed (COM init; avoid calling from STA UI thread)")?;
-
-    let enumerator = DeviceEnumerator::new()?;
-    let audio_err: Option<anyhow::Error> = match &cfg.audio.device {
-        AudioDeviceSelector::Id { id } if id.is_empty() => {
-            eprintln!("Warn: audio device ID is empty, using default device instead.");
-            audio::list_render_devices(&enumerator);
-            Some(anyhow!("Audio device ID must not be empty"))
-        }
-        AudioDeviceSelector::Name { name } if name.is_empty() => {
-            eprintln!("Warn: audio device name is empty, using default device instead.");
-            audio::list_render_devices(&enumerator);
-            Some(anyhow!("Audio device name must not be empty"))
-        }
-        _ => None,
-    };
-    if let Some(e) = audio_err {
-        eprintln!("{e:#}");
-        return Ok(());
-    }
-
-    let device = match audio::select_render_device(&enumerator, &cfg.audio.device) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Audio device selection failed: {e:#}");
-            audio::list_render_devices(&enumerator);
-            return Err(e);
-        }
-    };
-    let mut audio_client = device.get_iaudioclient()?;
-    let desired_format = audio_client.get_mixformat()?;
-
-    let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: cfg.audio.buffer_duration_hns as _ };
-    audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
-    let capture = audio_client.get_audiocaptureclient()?;
-    let event = audio_client.set_get_eventhandle()?;
-    audio_client.start_stream()?;
-
-    let channels = desired_format.get_nchannels() as usize;
-    let bytes_per_frame = channels * size_of::<f32>();
-    let sample_rate = desired_format.get_samplespersec().max(1) as f32;
-
     let mut warnings = Vec::new();
-    let mut analyzer = Analyzer::new(&cfg.audio, &bands, &cfg.dynamics, &cfg.output, sample_rate, &mut warnings);
+    let capture = Capture::start(&cfg.audio, Arc::clone(&running), &mut warnings)?;
+    let mut analyzer = Analyzer::new(&cfg.audio, &bands, &cfg.dynamics, &cfg.output, capture.sample_rate(), &mut warnings);
     for w in &warnings {
         eprintln!("Audio: {w}");
     }
+    eprintln!("Audio: capturing {} at {:.0} Hz", capture.source(), capture.sample_rate());
 
-    let silence_timeout = cfg.audio.silence_timeout_ms.min(u32::MAX as u64) as u32;
+    let silence_timeout = Duration::from_millis(cfg.audio.silence_timeout_ms.max(1));
     let mut dimmed_due_to_silence = false;
 
-    loop {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-
-        if event.wait_for_event(silence_timeout).is_err() {
-            if !dimmed_due_to_silence {
-                let _ = tx.send(Msg::Silence);
-                dimmed_due_to_silence = true;
-            }
-            continue;
-        }
-
-        while let Some(frames) = capture.get_next_packet_size()? {
-            if frames == 0 {
-                break;
-            }
-
-            let mut raw = vec![0u8; frames as usize * bytes_per_frame];
-            let (read_frames, _info) = capture.read_from_device(&mut raw)?;
-            if read_frames == 0 {
-                break;
-            }
-
-            let floats: &[f32] = audio::cast_slice(&raw);
-            for frame in floats.chunks_exact(channels) {
-                let Some(result) = analyzer.push(audio::downmix(frame, cfg.audio.downmix)) else { continue };
-                if result.has_signal {
-                    dimmed_due_to_silence = false;
+    while running.load(Ordering::SeqCst) {
+        match capture.recv_timeout(silence_timeout) {
+            Ok(chunk) => {
+                for sample in chunk {
+                    let Some(result) = analyzer.push(sample) else { continue };
+                    if result.has_signal {
+                        dimmed_due_to_silence = false;
+                    }
+                    let _ = tx.send(Msg::Sound(result));
                 }
-                let _ = tx.send(Msg::Sound(result));
             }
+            Err(RecvTimeoutError::Timeout) => {
+                if !dimmed_due_to_silence {
+                    let _ = tx.send(Msg::Silence);
+                    dimmed_due_to_silence = true;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break, // The capture threads are gone, nothing left to react to.
         }
     }
 
     restore_last_state(&runtime);
     Ok(())
+}
+
+fn parse_args() -> Result<Option<String>> {
+    let mut path: Option<String> = None;
+    let mut devices = false;
+    let mut apps = false;
+
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--list-devices" => devices = true,
+            "--list-apps" => apps = true,
+            "-h" | "--help" => {
+                usage();
+                return Ok(None);
+            }
+            unknown if unknown.starts_with('-') => {
+                eprintln!("Unknown option {unknown:?}.");
+                usage();
+                return Ok(None);
+            }
+            file => path = Some(file.to_string()),
+        }
+    }
+
+    if devices {
+        capture::list_devices();
+    }
+    if apps {
+        capture::print_apps()?;
+    }
+    if devices || apps {
+        return Ok(None);
+    }
+
+    Ok(Some(path.or_else(|| env::var("SHELLYRGBAUDIO_CONFIG").ok()).unwrap_or_else(|| "config.json".to_string())))
+}
+
+fn usage() {
+    eprintln!("Usage: ShellyRGBAudio [config.json] [--list-devices] [--list-apps]");
+    eprintln!("  --list-devices   print the output devices usable in audio.device");
+    eprintln!("  --list-apps      print the applications usable in audio.apps.groups[].apps");
 }
 
 /// Throttles, deduplicates and fans out to the lights. Each device keeps its own last frame, because two devices with different color maps legitimately differ on the same analysis.

@@ -2,6 +2,13 @@ use std::{env, fs, path::PathBuf};
 
 fn main() {
     generate_device_registry();
+    embed_windows_resources();
+}
+
+fn embed_windows_resources() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
 
     let mut res = winres::WindowsResource::new();
     res.set_icon("assets/ShellyRGBAudio.ico");
