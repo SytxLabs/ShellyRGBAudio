@@ -1,30 +1,12 @@
-use anyhow::{bail, Result};
+use crate::capture::select::LINUX_LOOPBACK_HINTS;
 
-use crate::capture::{AppInfo, AppTarget, CaptureStream};
-use crate::config::{AppsSection, AudioDeviceSelector, AudioSection};
+const LOOPBACK_HINTS: &[&str] = LINUX_LOOPBACK_HINTS;
 
-const MISSING: &str = "audio capture is not implemented on this platform yet (see src/capture/linux.rs)";
+const NO_LOOPBACK_HELP: &str = "\
+No monitor source was found. These come from PulseAudio or PipeWire, so check that one of them is running (`pactl info`).
+On a plain ALSA system there is no way to record the output, and a loopback device has to be set up by hand (`snd-aloop`).";
 
-pub fn list_devices() {
-    eprintln!("{MISSING}");
-}
+#[path = "cpal_backend.rs"]
+mod shared;
 
-pub fn list_apps() -> Result<Vec<AppInfo>> {
-    bail!(MISSING)
-}
-
-pub fn open_device(_sel: &AudioDeviceSelector, _audio: &AudioSection) -> Result<Box<dyn CaptureStream>> {
-    bail!(MISSING)
-}
-
-pub fn resolve_targets(_apps: &AppsSection) -> Result<Vec<AppTarget>> {
-    bail!(MISSING)
-}
-
-pub fn open_app(_target: &AppTarget, _audio: &AudioSection) -> Result<Box<dyn CaptureStream>> {
-    bail!(MISSING)
-}
-
-pub fn process_alive(_pid: u32) -> bool {
-    false
-}
+pub use shared::*;

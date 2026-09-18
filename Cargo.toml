@@ -21,6 +21,11 @@ serde_json = "1"
 digest_auth = "0.3"
 ctrlc = "3"
 
+# Linux and macOS capture goes through cpal, which wraps ALSA and CoreAudio. Windows keeps its own WASAPI backend below: cpal cannot report the
+# speaker channel mask, and loopback of an output device is a first class feature there rather than something to be found among the inputs.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+cpal = "0.18"
+
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.24.0"
 windows = { version = "0.62", features = [

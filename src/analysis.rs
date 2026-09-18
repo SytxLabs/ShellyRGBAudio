@@ -2,12 +2,14 @@ use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::audio::downmix;
 use crate::color::BandConfig;
-use crate::config::{AudioSection, DynamicsSection, LevelSource, Normalize, OutputSection, WindowKind};
+use crate::config::{AudioSection, Downmix, DynamicsSection, LevelSource, Normalize, OutputSection, WindowKind};
 
 #[derive(Debug, Clone)]
 pub struct Analysis {
     pub bands: Vec<f32>, // Normalized energy per band, `0.0` to `1.0`, in config band order.
+    pub channels: Vec<Vec<f32>>, // The same, once per capture channel, so a positioned device can follow the speakers it faces. Empty while `spatial.enabled` is false.
     pub overall: f32, // Loudness driving brightness, `0.0` to `1.0`. Already rose to the strobe level while a strobe is active.
     pub strobing: bool,
     pub transition_ms: u32,
@@ -20,8 +22,9 @@ pub struct Analyzer {
     fft_size: usize,
     hop: usize,
     window: Vec<f32>,
-    ring: Vec<f32>,
+    ring: Vec<f32>, // The downmixed mono signal. Everything except the per-device spatial response is derived from it.
     buf: Vec<Complex32>,
+    downmix: Downmix,
 
     bin_ranges: Vec<(usize, usize)>, // Inclusive bin range per band, precomputed from the sample rate.
     weights: Vec<f32>,
@@ -34,6 +37,10 @@ pub struct Analyzer {
     overall_ema: f32,
     flux_ema: f32,
 
+    ch_rings: Vec<Vec<f32>>,
+    ch_smoothed: Vec<Vec<f32>>,
+    energies: Vec<f32>, // Scratch, reused every hop so the hot path allocates nothing.
+
     strobe_until: Option<Instant>,
     last_beat: Option<Instant>,
 
@@ -42,7 +49,7 @@ pub struct Analyzer {
 }
 
 impl Analyzer {
-    pub fn new(audio: &AudioSection, bands: &[BandConfig], dynamics: &DynamicsSection, output: &OutputSection, sample_rate: f32, warnings: &mut Vec<String>) -> Self {
+    pub fn new(audio: &AudioSection, bands: &[BandConfig], dynamics: &DynamicsSection, output: &OutputSection, sample_rate: f32, spatial_channels: usize, warnings: &mut Vec<String>) -> Self {
         let fft_size = sanitize_fft_size(audio.fft_size, warnings);
         let hop = match audio.hop_size {
             0 => {
@@ -84,6 +91,7 @@ impl Analyzer {
             window: build_window(audio.window, fft_size),
             ring: Vec::with_capacity(fft_size),
             buf: vec![Complex32::new(0.0, 0.0); fft_size],
+            downmix: audio.downmix,
             bin_ranges,
             weights,
             weight_sum,
@@ -93,6 +101,9 @@ impl Analyzer {
             prev: vec![0.0; n],
             overall_ema: 0.0,
             flux_ema: 0.0,
+            ch_rings: vec![Vec::with_capacity(fft_size); spatial_channels],
+            ch_smoothed: vec![vec![0.0; n]; spatial_channels],
+            energies: Vec::with_capacity(n),
             strobe_until: None,
             last_beat: None,
             dynamics: dynamics.clone(),
@@ -100,52 +111,39 @@ impl Analyzer {
         }
     }
 
-    pub fn push(&mut self, sample: f32) -> Option<Analysis> {
-        self.ring.push(sample);
+    /// Takes one interleaved capture frame (`channels` samples) and returns an analysis whenever a full FFT window has come in.
+    pub fn push_frame(&mut self, frame: &[f32]) -> Option<Analysis> {
+        self.ring.push(downmix(frame, self.downmix));
+        for (i, ring) in self.ch_rings.iter_mut().enumerate() {
+            ring.push(frame.get(i).copied().unwrap_or(0.0)); // A frame shorter than the layout can only mean a format change; treat the missing channel as silent.
+        }
         if self.ring.len() < self.fft_size {
             return None;
         }
-
-        for i in 0..self.fft_size {
-            self.buf[i] = Complex32::new(self.ring[i] * self.window[i], 0.0);
-        }
-        self.ring.drain(..self.hop);
-        self.fft.process(&mut self.buf);
-
         Some(self.evaluate())
     }
 
     fn evaluate(&mut self) -> Analysis {
-        let d = &self.dynamics;
         let n = self.bin_ranges.len();
-
-        let mut energies = Vec::with_capacity(n);
-        let mut any_silent = false;
-        for &(lo, hi) in self.bin_ranges.iter() {
-            let mut power = 0.0f32;
-            if lo <= hi {
-                for bin in lo..=hi {
-                    power += self.buf[bin].norm_sqr();
-                }
-            }
-            if power <= 0.0 {
-                any_silent = true;
-            }
-            energies.push((power + d.log_offset).ln().max(0.0));
-        }
-
-        let floor = d.peak_floor.max(f32::MIN_POSITIVE);
-        let norms: Vec<f32> = match d.normalize {
+        let log_offset = self.dynamics.log_offset;
+        let any_silent = spectrum(&*self.fft, &self.window, &mut self.buf, &mut self.ring, self.hop, &self.bin_ranges, log_offset, &mut self.energies);
+        let energies = std::mem::take(&mut self.energies);
+        let (decay, floor) = (self.dynamics.peak_decay, self.dynamics.peak_floor.max(f32::MIN_POSITIVE));
+        let norms: Vec<f32> = match self.dynamics.normalize {
             Normalize::Shared => {
                 let loudest = energies.iter().copied().fold(0.0f32, f32::max);
-                self.shared_peak = (self.shared_peak.max(loudest) * d.peak_decay).max(floor);
+                self.shared_peak = (self.shared_peak.max(loudest) * decay).max(floor);
                 energies.iter().map(|e| (e / self.shared_peak).clamp(0.0, 1.0)).collect()
             }
             Normalize::PerBand => energies.iter().enumerate().map(|(i, e)| {
-                self.peaks[i] = (self.peaks[i].max(*e) * d.peak_decay).max(floor);
+                self.peaks[i] = (self.peaks[i].max(*e) * decay).max(floor);
                 (e / self.peaks[i]).clamp(0.0, 1.0)
             }).collect(),
         };
+        self.energies = energies; // Hand the scratch buffer back for the next hop.
+
+        let channels = self.evaluate_channels(log_offset);
+        let d = &self.dynamics;
 
         let mut flux = 0.0f32;
         let mut weighted_sum = 0.0f32;
@@ -184,12 +182,34 @@ impl Analyzer {
         let thr = d.beat_threshold.clamp(0.0, 0.999);
         Analysis {
             bands: self.smoothed.clone(),
+            channels,
             overall: if strobing { d.strobe_level.clamp(0.0, 1.0) } else { self.overall_ema },
             strobing,
             transition_ms: self.transition_ms(((self.flux_ema - thr) / (1.0 - thr)).clamp(0.0, 1.0)),
             force: false,
             has_signal: !any_silent,
         }
+    }
+
+    fn evaluate_channels(&mut self, log_offset: f32) -> Vec<Vec<f32>> {
+        if self.ch_rings.is_empty() {
+            return Vec::new();
+        }
+        let attack = self.dynamics.band_attack.clamp(0.01, 1.0);
+        let release = self.dynamics.band_release.clamp(0.01, 1.0);
+        let shared = if matches!(self.dynamics.normalize, Normalize::Shared) { Some(self.shared_peak) } else { None };
+
+        let mut energies = std::mem::take(&mut self.energies);
+        for (ring, smoothed) in self.ch_rings.iter_mut().zip(self.ch_smoothed.iter_mut()) {
+            spectrum(&*self.fft, &self.window, &mut self.buf, ring, self.hop, &self.bin_ranges, log_offset, &mut energies);
+            for (i, (smooth, e)) in smoothed.iter_mut().zip(energies.iter()).enumerate() {
+                let peak = shared.unwrap_or_else(|| self.peaks.get(i).copied().unwrap_or(f32::MIN_POSITIVE));
+                let norm = (e / peak).clamp(0.0, 1.0);
+                *smooth += (if norm > *smooth { attack } else { release }) * (norm - *smooth);
+            }
+        }
+        self.energies = energies;
+        self.ch_smoothed.clone()
     }
 
     fn transition_ms(&self, beat_strength: f32) -> u32 {
@@ -199,6 +219,27 @@ impl Analyzer {
         let (min, max) = (o.transition_min_ms as f32, o.transition_max_ms as f32);
         (max - mix * (max - min)).round().clamp(0.0, u16::MAX as f32) as u32
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spectrum(fft: &dyn Fft<f32>, window: &[f32], buf: &mut [Complex32], ring: &mut Vec<f32>, hop: usize, bin_ranges: &[(usize, usize)], log_offset: f32, out: &mut Vec<f32>) -> bool {
+    let size = window.len();
+    for (b, (sample, w)) in buf.iter_mut().zip(ring.iter().zip(window)).take(size) {
+        *b = Complex32::new(sample * w, 0.0);
+    }
+    ring.drain(..hop.min(ring.len()));
+    fft.process(buf);
+
+    out.clear();
+    let mut any_silent = false;
+    for &(lo, hi) in bin_ranges {
+        let power = if lo <= hi { buf[lo..=hi].iter().map(|c| c.norm_sqr()).sum::<f32>() } else { 0.0 };
+        if power <= 0.0 {
+            any_silent = true;
+        }
+        out.push((power + log_offset).ln().max(0.0));
+    }
+    any_silent
 }
 
 fn sanitize_fft_size(requested: usize, warnings: &mut Vec<String>) -> usize {

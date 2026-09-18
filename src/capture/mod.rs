@@ -10,15 +10,19 @@ use std::{
 };
 
 use crate::config::{AppMatchMode, AudioDeviceSelector, AudioSection};
+use crate::spatial::SpeakerLayout;
 
 #[cfg_attr(target_os = "windows", path = "windows.rs")]
 #[cfg_attr(target_os = "macos", path = "macos.rs")]
 #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), path = "linux.rs")]
 mod backend;
 
+mod select;
+
 pub trait CaptureStream {
     fn sample_rate(&self) -> f32;
-    fn read_mono(&mut self, out: &mut Vec<f32>) -> Result<usize>;
+    fn layout(&self) -> SpeakerLayout;
+    fn read_frames(&mut self, out: &mut Vec<f32>) -> Result<usize>;
 }
 #[derive(Debug, Clone)]
 pub struct AppTarget {
@@ -39,8 +43,6 @@ const SHUTDOWN_TICK: Duration = Duration::from_millis(200);
 const MAX_APP_STREAMS: usize = 64; // One client per captured process, so this caps the threads a broadly matching pattern can start.
 const SILENCE_EPSILON: f32 = 1e-6; // Below this a mixed chunk counts as digital silence and is not forwarded.
 const DEAD_APP_GRACE: Duration = Duration::from_secs(2); // Silence from an app before its process is checked for being gone.
-
-// ---------------------------------------------------------------- listing
 
 pub fn list_devices() {
     backend::list_devices();
@@ -67,37 +69,47 @@ pub fn print_apps() -> Result<()> {
 pub struct Capture {
     rx: mpsc::Receiver<Vec<f32>>,
     sample_rate: f32,
+    layout: SpeakerLayout,
     source: String,
 }
 
 impl Capture {
+    //noinspection RsConstantConditionIf
     pub fn start(audio: &AudioSection, running: Arc<AtomicBool>, warnings: &mut Vec<String>) -> Result<Capture> {
         if audio.apps.is_usable(warnings) {
-            Ok(start_apps(audio, running))
-        } else {
-            start_device(audio, running)
+            if backend::APP_CAPTURE_SUPPORTED {
+                return Ok(start_apps(audio, running));
+            }
+            warnings.push("audio.apps.enabled is true but capturing a single application is only implemented on Windows, capturing the output device instead".to_string());
         }
+        start_device(audio, running)
     }
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
     }
+    pub fn channels(&self) -> usize {
+        self.layout.len()
+    }
+    pub fn layout(&self) -> &SpeakerLayout {
+        &self.layout
+    }
     pub fn source(&self) -> &str {
         &self.source
     }
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<f32>, mpsc::RecvTimeoutError> {
-        self.rx.recv_timeout(timeout)
-    }
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<f32>, mpsc::RecvTimeoutError> { self.rx.recv_timeout(timeout) }
 }
+
+struct StreamInfo { sample_rate: f32, layout: SpeakerLayout, }
 
 fn start_device(audio: &AudioSection, running: Arc<AtomicBool>) -> Result<Capture> {
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<f32>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<StreamInfo>>();
 
     let cfg = audio.clone();
     thread::Builder::new().name("capture-device".to_string()).spawn(move || {
         let mut stream = match backend::open_device(&cfg.device, &cfg) {
             Ok(s) => {
-                let _ = ready_tx.send(Ok(s.sample_rate()));
+                let _ = ready_tx.send(Ok(StreamInfo { sample_rate: s.sample_rate(), layout: s.layout() }));
                 s
             }
             Err(e) => {
@@ -109,8 +121,8 @@ fn start_device(audio: &AudioSection, running: Arc<AtomicBool>) -> Result<Captur
         pump(&mut *stream, &tx, &running);
     })?;
 
-    let sample_rate = ready_rx.recv().context("capture thread died before it was ready")??;
-    Ok(Capture { rx, sample_rate, source: describe_device(&audio.device) })
+    let info = ready_rx.recv().context("capture thread died before it was ready")??;
+    Ok(Capture { rx, sample_rate: info.sample_rate, layout: info.layout, source: describe_device(&audio.device) })
 }
 
 fn describe_device(sel: &AudioDeviceSelector) -> String {
@@ -125,7 +137,7 @@ fn pump(stream: &mut dyn CaptureStream, tx: &mpsc::Sender<Vec<f32>>, running: &A
     let mut buf = Vec::new();
     while running.load(Ordering::SeqCst) {
         buf.clear();
-        match stream.read_mono(&mut buf) {
+        match stream.read_frames(&mut buf) {
             Ok(0) => continue,
             Ok(_) => {
                 if tx.send(std::mem::take(&mut buf)).is_err() {
@@ -151,24 +163,25 @@ fn start_apps(audio: &AudioSection, running: Arc<AtomicBool>) -> Capture {
     let (tx, rx) = mpsc::channel::<Vec<f32>>();
     let apps = audio.apps.clone();
     let sample_rate = apps.sample_rate.max(8_000) as f32;
+    let channels = apps.channels.clamp(1, 8) as usize;
     let live: Arc<Mutex<Vec<Arc<Slot>>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let live = Arc::clone(&live);
         let running = Arc::clone(&running);
-        let capacity = sample_rate as usize; // One second per app is plenty; older samples are dropped.
+        let capacity = sample_rate as usize * channels; // One second per app is plenty; older samples are dropped.
         let audio = audio.clone();
         let _ = thread::Builder::new().name("capture-apps".to_string()).spawn(move || { supervise(audio, live, running, capacity); });
     }
     {
         let running = Arc::clone(&running);
-        let max_chunk = (sample_rate * 0.1) as usize; // Never hand out more than 100 ms at once.
-        let _ = thread::Builder::new().name("capture-mixer".to_string()).spawn(move || { mix(live, tx, running, max_chunk); });
+        let max_chunk = (sample_rate * 0.1) as usize * channels; // Never hand out more than 100 ms at once.
+        let _ = thread::Builder::new().name("capture-mixer".to_string()).spawn(move || { mix(live, tx, running, max_chunk, channels); });
     }
     let mut patterns: Vec<String> = Vec::new();
     for g in apps.active_groups() {
         patterns.extend(g.apps.iter().filter(|p| !p.trim().is_empty()).cloned());
     }
-    Capture { rx, sample_rate, source: match apps.mode {
+    Capture { rx, sample_rate, layout: SpeakerLayout::from_count(channels), source: match apps.mode {
         AppMatchMode::Include => format!("apps {}", patterns.join(", ")),
         AppMatchMode::Exclude => format!("every app except {}", patterns.join(", ")),
     }}
@@ -230,6 +243,7 @@ fn supervise(audio: AudioSection, live: Arc<Mutex<Vec<Arc<Slot>>>>, running: Arc
 }
 
 fn capture_app(target: &AppTarget, audio: &AudioSection, slot: &Slot, running: &AtomicBool, capacity: usize) {
+    let channels = audio.apps.channels.clamp(1, 8) as usize;
     let mut stream = match backend::open_app(target, audio) {
         Ok(s) => s,
         Err(e) => {
@@ -243,7 +257,7 @@ fn capture_app(target: &AppTarget, audio: &AudioSection, slot: &Slot, running: &
     let mut announced = false;
     while running.load(Ordering::SeqCst) {
         buf.clear();
-        match stream.read_mono(&mut buf) {
+        match stream.read_frames(&mut buf) {
             Ok(0) => {
                 if last_data.elapsed() > DEAD_APP_GRACE && !backend::process_alive(target.pid) {
                     break;
@@ -256,7 +270,9 @@ fn capture_app(target: &AppTarget, audio: &AudioSection, slot: &Slot, running: &
                     announced = true;
                 }
                 let mut q = lock(&slot.buf);
-                let overflow = (q.len() + buf.len()).saturating_sub(capacity).min(q.len());
+                // Drop whole frames only: a partial drain would shift this slot's channels against the other apps' from then on.
+                let overflow = (q.len() + buf.len()).saturating_sub(capacity).min(q.len()).div_ceil(channels) * channels;
+                let overflow = overflow.min(q.len());
                 q.drain(..overflow);
                 q.extend(buf.iter().copied());
             }
@@ -271,8 +287,9 @@ fn capture_app(target: &AppTarget, audio: &AudioSection, slot: &Slot, running: &
     }
 }
 
-fn mix(live: Arc<Mutex<Vec<Arc<Slot>>>>, tx: mpsc::Sender<Vec<f32>>, running: Arc<AtomicBool>, max_chunk: usize) {
-    let max_chunk = max_chunk.max(64);
+fn mix(live: Arc<Mutex<Vec<Arc<Slot>>>>, tx: mpsc::Sender<Vec<f32>>, running: Arc<AtomicBool>, max_chunk: usize, channels: usize) {
+    let channels = channels.max(1);
+    let max_frames = (max_chunk.max(64) / channels).max(1);
 
     while running.load(Ordering::SeqCst) {
         thread::sleep(MIX_TICK);
@@ -282,19 +299,17 @@ fn mix(live: Arc<Mutex<Vec<Arc<Slot>>>>, tx: mpsc::Sender<Vec<f32>>, running: Ar
             continue;
         }
 
-        let frames = slots.iter().map(|s| lock(&s.buf).len()).max().unwrap_or(0).min(max_chunk);
+        let frames = slots.iter().map(|s| lock(&s.buf).len() / channels).max().unwrap_or(0).min(max_frames);
         if frames == 0 {
             continue;
         }
-        let mut mixed = vec![0.0f32; frames];
+        let mut mixed = vec![0.0f32; frames * channels];
         let mut loudest = 0.0f32;
         for slot in &slots {
             let mut q = lock(&slot.buf);
-            for out in mixed.iter_mut() {
-                match q.pop_front() {
-                    Some(s) => *out += s * slot.gain,
-                    None => break,
-                }
+            let take = (q.len() / channels).min(frames) * channels;
+            for (out, s) in mixed.iter_mut().zip(q.drain(..take)) {
+                *out += s * slot.gain;
             }
         }
         for s in mixed.iter_mut() {

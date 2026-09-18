@@ -5,6 +5,12 @@ fn main() {
     embed_windows_resources();
 }
 
+/// `winres` is a Windows-only build dependency, so this has to be gated on the *host* as well as the target: on a Linux or macOS machine the crate is
+/// not there to compile against at all, and an unconditional call fails the build script before it ever runs.
+#[cfg(not(windows))]
+fn embed_windows_resources() {}
+
+#[cfg(windows)]
 fn embed_windows_resources() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

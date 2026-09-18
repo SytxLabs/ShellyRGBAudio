@@ -4,6 +4,7 @@ mod capture;
 mod color;
 mod config;
 mod devices;
+mod spatial;
 
 use crate::analysis::{Analysis, Analyzer};
 use crate::capture::Capture;
@@ -40,10 +41,26 @@ fn main() -> Result<()> {
         gamma_max: cfg.output.gamma_max,
     });
 
-    let runtime: Arc<Vec<RuntimeDevice>> = Arc::new(devices::build_all(&cfg.devices, &bands, &cfg.color_map, &mut warnings)?);
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let running = Arc::clone(&running);
+        ctrlc::set_handler(move || { running.store(false, Ordering::SeqCst); })?;
+    }
+
+    // The capture has to be open before the devices are built: their positions are weighted against the speaker layout it reports.
+    let mut audio_warnings = Vec::new();
+    let capture = Capture::start(&cfg.audio, Arc::clone(&running), &mut audio_warnings)?;
+    let layout = capture.layout().clone().resolve(&cfg.spatial.layout, &mut warnings);
+
+    let runtime: Arc<Vec<RuntimeDevice>> = Arc::new(devices::build_all(&cfg.devices, &bands, &cfg.color_map, &cfg.spatial, &layout, &mut warnings)?);
     for w in &warnings {
         eprintln!("Config: {w}");
     }
+    for w in &audio_warnings {
+        eprintln!("Audio: {w}");
+    }
+    eprintln!("Audio: capturing {} at {:.0} Hz, {}", capture.source(), capture.sample_rate(), layout.describe());
+
     if runtime.is_empty() {
         eprintln!("Warn: no devices configured, nothing will be controlled.");
     }
@@ -51,15 +68,12 @@ fn main() -> Result<()> {
         let engine = dev.engine.as_deref().unwrap_or(&global_engine);
         eprintln!("Device: {}{}", dev.name(), if dev.engine.is_some() { " (own color map)" } else { "" });
         eprintln!("  {}", describe_bands(&bands, engine));
+        if let Some(s) = &dev.spatial {
+            eprintln!("  {}", s.describe(&layout));
+        }
     }
     if runtime.is_empty() {
         eprintln!("Color map: {}", describe_bands(&bands, &global_engine));
-    }
-
-    let running = Arc::new(AtomicBool::new(true));
-    {
-        let running = Arc::clone(&running);
-        ctrlc::set_handler(move || { running.store(false, Ordering::SeqCst); })?;
     }
 
     let old_hook = std::panic::take_hook();
@@ -74,13 +88,14 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let _sender_thread = spawn_sender(Arc::clone(&runtime), Arc::clone(&global_engine), &cfg, bands.len(), rx);
 
+    // The per-channel FFTs only run when a device actually asked to be positioned, so an unused `spatial` section costs nothing.
+    let channels = capture.channels().max(1);
+    let spatial_channels = if runtime.iter().any(|d| d.spatial.is_some()) { channels } else { 0 };
     let mut warnings = Vec::new();
-    let capture = Capture::start(&cfg.audio, Arc::clone(&running), &mut warnings)?;
-    let mut analyzer = Analyzer::new(&cfg.audio, &bands, &cfg.dynamics, &cfg.output, capture.sample_rate(), &mut warnings);
+    let mut analyzer = Analyzer::new(&cfg.audio, &bands, &cfg.dynamics, &cfg.output, capture.sample_rate(), spatial_channels, &mut warnings);
     for w in &warnings {
         eprintln!("Audio: {w}");
     }
-    eprintln!("Audio: capturing {} at {:.0} Hz", capture.source(), capture.sample_rate());
 
     let silence_timeout = Duration::from_millis(cfg.audio.silence_timeout_ms.max(1));
     let mut dimmed_due_to_silence = false;
@@ -88,8 +103,8 @@ fn main() -> Result<()> {
     while running.load(Ordering::SeqCst) {
         match capture.recv_timeout(silence_timeout) {
             Ok(chunk) => {
-                for sample in chunk {
-                    let Some(result) = analyzer.push(sample) else { continue };
+                for frame in chunk.chunks_exact(channels) {
+                    let Some(result) = analyzer.push_frame(frame) else { continue };
                     if result.has_signal {
                         dimmed_due_to_silence = false;
                     }
@@ -168,7 +183,8 @@ fn spawn_sender(runtime: Arc<Vec<RuntimeDevice>>, global: Arc<ColorEngine>, cfg:
 
         let mut last: Vec<Option<Frame>> = vec![None; runtime.len()];
         let mut last_sent = Instant::now() - min_send_interval;
-
+        let mut scratch: Vec<Vec<f32>> = vec![Vec::with_capacity(band_count); runtime.len()];
+        let mut gradients: Vec<Vec<Rgbw>> = runtime.iter().zip(&initial).map(|(d, f)| vec![Rgbw { r: f.r, g: f.g, b: f.b, w: f.w }; if d.segment_count() > 1 { d.segment_count() } else { 0 }]).collect();
         while let Ok(mut msg) = rx.recv() {
             while let Ok(newer) = rx.try_recv() {
                 msg = newer;
@@ -181,11 +197,31 @@ fn spawn_sender(runtime: Arc<Vec<RuntimeDevice>>, global: Arc<ColorEngine>, cfg:
             for (i, dev) in runtime.iter().enumerate() {
                 let (frame, force) = match &msg {
                     Msg::Sound(a) => {
-                        let mut color = dev.engine.as_deref().unwrap_or(&global).resolve(&a.bands, a.overall);
+                        let bands = match &dev.spatial {
+                            Some(s) if !a.channels.is_empty() => {
+                                s.resolve_bands(&a.bands, &a.channels, &mut scratch[i]);
+                                &scratch[i]
+                            }
+                            _ => &a.bands,
+                        };
+                        let overall = a.overall * dev.spatial.as_ref().map_or(1.0, |s| s.distance_gain);
+                        let engine = dev.engine.as_deref().unwrap_or(&global);
+                        let mut color = engine.resolve(bands, overall);
                         if a.strobing && let Some(c) = strobe_color {
                             color = c;
                         }
-                        (to_frame(color, a.overall, a.transition_ms), a.force)
+                        if !gradients[i].is_empty() {
+                            match (&dev.spatial, a.strobing && strobe_color.is_some()) {
+                                (Some(s), false) if !a.channels.is_empty() => {
+                                    for seg in 0..gradients[i].len() {
+                                        s.resolve_segment_bands(seg, &a.bands, &a.channels, &mut scratch[i]);
+                                        gradients[i][seg] = engine.resolve(&scratch[i], overall);
+                                    }
+                                }
+                                _ => gradients[i].fill(color),
+                            }
+                        }
+                        (to_frame(color, overall, a.transition_ms), a.force)
                     }
                     Msg::Silence => {
                         let base = last[i].unwrap_or(initial[i]);
@@ -196,7 +232,7 @@ fn spawn_sender(runtime: Arc<Vec<RuntimeDevice>>, global: Arc<ColorEngine>, cfg:
                 if !force && !changed(&frame, last[i].as_ref(), deadband_rgb, deadband_overall) {
                     continue;
                 }
-                if let Err(e) = dev.apply(&frame) {
+                if let Err(e) = dev.apply(&frame, &gradients[i]) {
                     eprintln!("{}: apply failed (ignored): {e:#}", dev.name());
                 }
                 last[i] = Some(frame);

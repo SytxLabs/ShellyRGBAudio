@@ -31,6 +31,7 @@ pub struct GoveeLanConfig {
     pub remote_port: u16,
     pub read_timeout_ms: u64,
     pub color_temp_kelvin: u32,
+    pub dreamview: bool,
 }
 
 impl Default for GoveeLanConfig {
@@ -46,6 +47,7 @@ impl Default for GoveeLanConfig {
             remote_port: 4003,
             read_timeout_ms: 300,
             color_temp_kelvin: 0,
+            dreamview: false,
         }
     }
 }
@@ -57,11 +59,8 @@ struct SharedSocket {
     port: u16,
     read_timeout_ms: u64,
 }
-
-/// All Govee LAN lights share one UDP socket, because the protocol requires the local port 4002, and it can only be bound once per process.
 static CLIENT: OnceLock<std::result::Result<SharedSocket, String>> = OnceLock::new();
-
-fn client(bind: &str, port: u16, read_timeout_ms: u64) -> Result<Arc<GoveeLan>> {
+pub fn shared_client(bind: &str, port: u16, read_timeout_ms: u64) -> Result<Arc<GoveeLan>> {
     let shared = CLIENT
         .get_or_init(|| {
             GoveeLan::new(bind, port, read_timeout_ms).map(|lan| SharedSocket { lan: Arc::new(lan), bind: bind.to_string(), port, read_timeout_ms }).map_err(|e| format!("{e:#}"))
@@ -83,17 +82,21 @@ pub struct GoveeDevice {
 
 impl GoveeDevice {
     pub fn new(cfg: GoveeLanConfig) -> Result<Self> {
-        let lan = client(&cfg.local_bind_addr, cfg.local_port, cfg.read_timeout_ms)?;
+        let lan = shared_client(&cfg.local_bind_addr, cfg.local_port, cfg.read_timeout_ms)?;
         let initial = lan.get_state(&cfg.ip, cfg.remote_port).ok();
+        if cfg.dreamview {
+            lan.set_razer_mode(&cfg.ip, cfg.remote_port, true).ok();
+        }
         Ok(Self { cfg, lan, initial })
     }
 }
 
 impl Device for GoveeDevice {
     fn name(&self) -> String {
+        let dreamview = if self.cfg.dreamview { ", dreamview" } else { "" };
         match &self.cfg.name {
-            Some(n) => format!("govee_lan {n} ({})", self.cfg.ip),
-            None => format!("govee_lan {}", self.cfg.ip),
+            Some(n) => format!("govee_lan {n} ({}{dreamview})", self.cfg.ip),
+            None => format!("govee_lan {}{dreamview}", self.cfg.ip),
         }
     }
 
@@ -107,9 +110,8 @@ impl Device for GoveeDevice {
     }
 
     fn restore(&self) -> Result<()> {
-        if let Some(st) = self.initial {
-            self.lan.restore_state(&self.cfg.ip, self.cfg.remote_port, st, self.cfg.color_temp_kelvin)?;
-        }
+        if self.cfg.dreamview { self.lan.set_razer_mode(&self.cfg.ip, self.cfg.remote_port, false).ok(); }
+        if let Some(st) = self.initial { self.lan.restore_state(&self.cfg.ip, self.cfg.remote_port, st, self.cfg.color_temp_kelvin)?; }
         Ok(())
     }
 }
@@ -155,6 +157,14 @@ impl GoveeLan {
         self.send_cmd(ip, port, "turn", json!({ "value": if on { 1 } else { 0 } }))
     }
 
+    pub fn set_razer_mode(&self, ip: &str, port: u16, on: bool) -> Result<()> {
+        self.send_pt(ip, port, &razer_mode_packet(on))
+    }
+
+    pub fn send_pt(&self, ip: &str, port: u16, packet: &[u8]) -> Result<()> {
+        self.send_cmd(ip, port, "razer", json!({ "pt": base64(packet) }))
+    }
+
     pub fn get_state(&self, ip: &str, port: u16) -> Result<GoveeState> {
         self.send_cmd(ip, port, "devStatus", json!({}))?;
 
@@ -178,4 +188,36 @@ impl GoveeLan {
         self.set_rgb(ip, port, s.r, s.g, s.b, color_temp_kelvin).ok();
         Ok(())
     }
+}
+
+pub fn govee_packet(payload: &[u8]) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out[0] = 0x33;
+    let n = payload.len().min(18);
+    out[1..1 + n].copy_from_slice(&payload[..n]);
+    out[19] = out[..19].iter().fold(0u8, |acc, b| acc ^ b);
+    out
+}
+
+pub fn razer_mode_packet(on: bool) -> [u8; 6] {
+    let mut out = [0xBB, 0x00, 0x01, 0xB1, u8::from(on), 0x00];
+    out[5] = out[..5].iter().fold(0u8, |acc, b| acc ^ b);
+    out
+}
+
+pub fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - i * 6)) as usize & 0x3F] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }

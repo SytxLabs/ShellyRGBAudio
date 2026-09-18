@@ -1,6 +1,9 @@
 use crate::config::Downmix;
+#[cfg(target_os = "windows")]
 use std::slice::from_raw_parts;
 
+/// Reinterprets a byte buffer as samples. Only the WASAPI backend hands over raw bytes; every other backend already delivers typed samples.
+#[cfg(target_os = "windows")]
 pub fn cast_slice<T: Copy, U: Copy>(data: &[T]) -> &[U] {
     let byte_ptr = data.as_ptr() as *const U;
     let byte_len = size_of_val(data);

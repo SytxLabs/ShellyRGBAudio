@@ -1,37 +1,77 @@
 # ShellyRGBAudio
 
-A Rust application that synchronizes RGBW lights with your computer's audio output in real time. It captures the Windows audio stream with WASAPI, runs an FFT over it, and maps the result to color and brightness on your lights.
+A Rust application that synchronizes RGBW lights with your computer's audio output in real time. It captures the system audio, runs an FFT over it, and maps the result to color and brightness on your lights. Runs on Windows, Linux and macOS.
 
 ## Features
 
 - **Multi-device:** drive any number of lights at once, of different makes.
 - **Shelly:** Gen1 (RGBW2) and Gen2 (Plus RGBW PM), with automatic API detection and optional authentication.
-- **Govee LAN:** local UDP control, no cloud account.
+- **Govee LAN:** local UDP control, no cloud account, with an optional DreamView mode that lifts the light's rate limiting.
+- **WLED:** driven over the UDP realtime protocol, with a real gradient along the strip.
+- **Addressable strips:** a positioned strip is colored per segment, so bass can sit at one end and treble at the other instead of the whole strip showing one color.
 - **Fully configurable frequency to color mapping:** you decide which color sits at which frequency; frequencies in between are interpolated.
 - **Free frequency bands:** any number, any boundaries, individually weighted and optionally individually colored.
 - **Per-app audio:** follow single applications instead of the whole output device, one or more at a time, or everything except a few. See [`audio.apps`](#audioapps).
 - **Per-device color:** every light may use its own color map while they all share one audio analysis.
+- **3D positioning:** place each light in the room and it follows the speakers it faces, so a left light answers the left channel and a rear light the surrounds. Lights are either a **lamp** (a point) or a **light strip**, which may run straight or bend around corners. See [`spatial`](#spatial).
 - **Everything else is configurable too:** FFT size and overlap, window function, smoothing, beat detection, strobe, transitions, silence handling, network timeouts.
 - **Smart throttling:** deduplicates and rate-limits network traffic so the lights stay responsive.
 - **State restoration:** puts the lights back the way it found them on exit.
 
-Windows only for now, because the audio capture uses WASAPI. The capture sits behind one small platform boundary in `src/capture/`, so a Linux or macOS backend can be added there without touching the rest.
+Runs on Windows, Linux and macOS. Everything except the audio capture is platform independent; capture sits behind one small boundary in `src/capture/`, with a WASAPI backend on Windows and a [cpal](https://github.com/RustAudio/cpal) one on Linux and macOS.
 
 ## Installation
 
 1. Install [Rust](https://www.rust-lang.org/tools/install).
 2. Clone this repository.
-3. Build:
+3. Install the build dependencies for your platform:
+   - **Windows** — none.
+   - **Linux** — the ALSA headers, which cpal needs to build: `sudo apt install libasound2-dev` (Debian/Ubuntu) or `sudo dnf install alsa-lib-devel` (Fedora).
+   - **macOS** — none to build, but see [Capturing on macOS](#capturing-on-macos) before running.
+4. Build:
    ```bash
    cargo build --release
    ```
+
+### Capturing the system audio
+
+Windows can record an output device directly. Linux and macOS cannot: what they offer is a *capture* device that happens to carry the output, and the two platforms differ in where it comes from.
+
+Run `--list-devices` on any platform to see what is available; on Linux and macOS the usable ones are marked `[system output]`.
+
+#### Capturing on Linux
+
+PulseAudio and PipeWire give every output a matching **monitor source**, and that is what gets recorded. Nothing has to be set up: leave `audio.device` on its default and the monitor is found automatically.
+
+```
+--- Capture devices (usable in audio.device) ---
+  - alsa_input.pci-0000_00_1f.3.analog-stereo  [default input]
+  - alsa_output.pci-0000_00_1f.3.analog-stereo.monitor  [system output]
+```
+
+PipeWire works through its `pipewire-pulse` compatibility layer, which every desktop that ships PipeWire also ships. On a machine running neither, capture falls back to ALSA, which can only see real recording hardware — there will be no `[system output]` entry, and a loopback device has to be set up by hand with `snd-aloop`.
+
+#### Capturing on macOS
+
+macOS has no loopback of its own, so it needs a **virtual audio driver**. [BlackHole](https://existential.audio/blackhole) is the usual free one; Loopback and Soundflower work too.
+
+1. Install BlackHole.
+2. Open **Audio MIDI Setup** → **+** → **Create Multi-Output Device**, and tick both your real speakers and BlackHole.
+3. Select that Multi-Output Device as the system output. The sound goes to both, so you still hear it.
+4. Leave `audio.device` on its default — BlackHole is recognised automatically — or name it explicitly.
+
+macOS asks for microphone permission the first time the program records; it has to be granted, because a virtual audio device is a recording device as far as the system is concerned.
+
+> **Per-application capture is Windows only.** [`audio.apps`](#audioapps) relies on process loopback, which has no equivalent through cpal. Turning it on elsewhere prints a warning and records the whole output device instead.
+>
+> **Speaker layouts are guessed off Linux and macOS.** WASAPI reports which speaker sits on which channel; cpal does not, so the layout comes from the channel count alone (2 → stereo, 6 → 5.1, 8 → 7.1). That is right for almost every setup, and [`spatial.layout`](#spatial) states it by hand where it is not.
 
 ## Running
 
 ```bash
 cargo run --release                   # uses ./config.json
 cargo run --release -- my-setup.json  # explicit path
-cargo run --release -- --list-devices # print the output devices, then exit
+cargo run --release -- --list-devices # print the capture devices (with speaker layouts on Windows), then exit
 cargo run --release -- --list-apps    # print the applications, then exit
 ```
 
@@ -253,19 +293,44 @@ An array. Order does not matter, it gets sorted by `from_hz`. Bands may overlap,
 | `brightness_floor`                                   | `1`             | Lowest brightness ever sent. `1` keeps lights from switching off entirely.                       |
 | `gamma_min` / `gamma_max`                            | `0.1` / `5.0`   | Bounds each device's `brightness_gamma` is clamped into.                                         |
 
+### `spatial`
+
+Places the lights in the room so each one follows the part of the audio that comes from its direction. Off by default; see [3D positioning](#3d-positioning) for the whole picture.
+
+| Setting            | Default                                 | Description                                                                                                                       |
+|--------------------|-----------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| `enabled`          | `false`                                 | While false no per-channel analysis runs at all and every light follows the global mix, exactly as before.                         |
+| `layout`           | `"auto"`                                | `"auto"` reads the speaker layout from the audio device. To state it by hand: `{"channels": ["front_left", "front_right", ...]}`. |
+| `room`             | `{"min":[-3,0,-3],"max":[3,3,3]}`       | Bounds of the room in metres. Only `min.y` / `max.y` are used today, to map a light's height onto the spectrum.                   |
+| `focus`            | `2.0`                                   | How tightly a light aims at the speakers it faces. Higher separates the lights more sharply.                                       |
+| `omni_floor`       | `0.15`                                  | Share of the audio every light hears regardless of direction, so a hard left light never loses the right channel entirely.        |
+| `strip_samples`    | `8`                                     | How many points a `strip` light is sampled at along its length.                                                                   |
+| `height_sharpness` | `0.35`                                  | Width of the height-to-frequency match. Smaller ties a height to fewer bands.                                                      |
+| `distance_falloff` | `0.0`                                   | Brightness lost per metre from the listener. `0.0` keeps every light equally bright.                                              |
+
 ### `devices`
 
 An array of light definitions, each identified by its `type`.
 
 Common to every type:
 
-| Setting            | Default   | Description                                                                                                               |
-|--------------------|-----------|---------------------------------------------------------------------------------------------------------------------------|
-| `min_brightness`   | `1`       | Lower brightness limit, 0 to 100.                                                                                         |
-| `max_brightness`   | `80`      | Upper brightness limit, 1 to 100.                                                                                         |
-| `brightness_gamma` | `0.6`     | Brightness curve. Below 1 lifts quiet passages, above 1 emphasises peaks.                                                 |
-| `color_map`        | inherited | Optional. Overrides the global color map for this light only; keys you leave out are inherited.                           |
-| `bands`            | inherited | Optional. Overrides `color` and `weight` of the global bands, matched by `name`. Band boundaries stay global — see below. |
+| Setting            | Default    | Description                                                                                                               |
+|--------------------|------------|---------------------------------------------------------------------------------------------------------------------------|
+| `min_brightness`   | `1`        | Lower brightness limit, 0 to 100.                                                                                         |
+| `max_brightness`   | `80`       | Upper brightness limit, 1 to 100.                                                                                         |
+| `brightness_gamma` | `0.6`      | Brightness curve. Below 1 lifts quiet passages, above 1 emphasises peaks.                                                 |
+| `color_map`        | inherited  | Optional. Overrides the global color map for this light only; keys you leave out are inherited.                           |
+| `bands`            | inherited  | Optional. Overrides `color` and `weight` of the global bands, matched by `name`. Band boundaries stay global — see below. |
+| `form`             | `"lamp"`   | `"lamp"` is a point, `"strip"` runs along a line or a `path`. See [3D positioning](#3d-positioning).                                          |
+| `position`         | `null`     | Where the light is, in metres. A lamp sits here; a strip is centred here. `null` leaves it unpositioned — see below.      |
+| `extent`           | `[0,0,0]`  | Straight strips only. Half the strip's length as a vector: it runs from `position - extent` to `position + extent`.       |
+| `path`             | `null`     | The corners a strip actually follows, for one that bends. Overrides `position` and `extent`. See [strips that bend](#strips-that-bend). |
+| `spatiality`       | `0.0`      | How much position overrides the global mix. `0.0` ignores it entirely, `1.0` is fully directional.                        |
+| `elevation_tilt`   | `null`     | How strongly height maps onto frequency. `null` decides automatically, see below.                                         |
+| `focus`            | inherited  | Optional. Overrides `spatial.focus` for this light.                                                                       |
+| `distance_falloff` | inherited  | Optional. Overrides `spatial.distance_falloff` for this light.                                                            |
+
+> **A light is only positioned once it has a `position` or a `path`.** Until then every other field in this block is inert and the light behaves exactly as it did before positions existed: it follows the global mix and shows one color, addressable or not. Setting `spatiality` without placing the light says so at startup rather than guessing where it is.
 
 #### `type: "shelly"`
 
@@ -289,8 +354,44 @@ Common to every type:
 | `color_temp_kelvin`              | `0`                | `0` keeps the light in RGB mode.               |
 | `local_bind_addr` / `local_port` | `0.0.0.0` / `4002` | Local socket. The protocol requires port 4002. |
 | `read_timeout_ms`                | `300`              | How long to wait for a status reply.           |
+| `dreamview`                      | `false`            | Puts the light into Razer / DreamView mode for the run, which lifts the rate limiting it normally applies to color changes. Colors still go out as the ordinary documented commands, so a light that ignores the mode behaves exactly as before. |
 
 > All Govee lights in one process share a single UDP socket, because the protocol pins the local port. `local_bind_addr`, `local_port` and `read_timeout_ms` therefore come from the first Govee entry; a second entry asking for different values gets a warning and the existing socket. `remote_port` is per light.
+
+#### `type: "wled"`
+
+Driven over WLED's UDP realtime protocol on port 21324, which is low latency and needs no HTTP request per frame. **Addressable:** give the light a position and each segment is colored from where that segment physically is.
+
+| Setting              | Default        | Description                                                                                                                             |
+|----------------------|----------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| `host`               | `192.168.1.70` | IP address or hostname.                                                                                                                 |
+| `leds`               | `null`         | Pixel count. `null` reads it from the controller over HTTP; state it by hand if that request cannot get through.                        |
+| `segments`           | `16`           | How many independently colored runs the pixels are divided into. `1` makes the whole strip one color.                                   |
+| `protocol`           | `"dnrgb"`      | `warls`, `drgb`, `drgbw` or `dnrgb`. Only `dnrgb` can address past pixel 490, so it is the default. Use `drgbw` for an RGBW strip.      |
+| `port`               | `21324`        | WLED's realtime port.                                                                                                                   |
+| `realtime_timeout_s` | `2`            | WLED resumes its own effect this long after the last packet. This is also what restores the strip when the program exits.               |
+| `reverse`            | `false`        | Flips which end of the strip segment 0 sits at, for a strip mounted the other way round.                                                |
+| `http_timeout_ms`    | `3000`         | Timeout for the two HTTP requests, made only at startup and shutdown.                                                                   |
+| `local_bind_addr`    | `0.0.0.0:0`    | Local UDP socket. The default lets the OS pick a port.                                                                                  |
+
+> The realtime protocol carries no brightness field, so `min_brightness` / `max_brightness` / `brightness_gamma` are multiplied into the pixel values before sending. Nothing has to be restored by hand: the `realtime_timeout_s` countdown hands the strip back to whatever effect it was running, and only the brightness and power WLED reported at startup are written back.
+
+#### `type: "govee_dreamview"`
+
+A Govee strip driven in DreamView / Razer mode, with an attempt at addressing its segments individually.
+
+| Setting     | Default          | Description                                                                                                       |
+|-------------|------------------|---------------------------------------------------------------------------------------------------------------------|
+| `ip`        | `192.168.1.61`   | IP address of the light.                                                                                          |
+| `name`      | `"DreamView"`    | Label used in log output.                                                                                         |
+| `segments`  | `1`              | How many segments the strip exposes, at most 15. `1` uses only the documented whole-device commands — see below.  |
+| `reverse`   | `false`          | Flips which end of the strip segment 0 sits at.                                                                   |
+
+Everything else (`remote_port`, `local_bind_addr`, `local_port`, `read_timeout_ms`, `color_temp_kelvin`) works exactly as in [`govee_lan`](#type-govee_lan), and the same shared-socket note applies.
+
+> **What is verified and what is not.** DreamView / Razer mode itself works: the mode packet is the one the Govee apps send, and the colors go out as the ordinary documented `colorwc` and `brightness` commands. That is what `segments: 1` does, and it is the setting to use if you want something dependable.
+>
+> **Per-segment addressing is not verified against hardware.** Govee's published LAN API has no segment command at all — segment control is a BLE feature on the models that have it. This device sends the BLE segment command through the LAN Razer transport, which is the most plausible mapping but may simply be ignored. Setting `segments` above 1 prints a reminder at startup. If the strip does not follow the gradient, set `segments: 1` and you are back on the path that works.
 
 ### Per-device color
 
@@ -315,6 +416,151 @@ Each light may override the color mapping while sharing the same audio analysis:
 
 Keys left out of a device's `color_map` are inherited from the global section, so the snippet above changes only the stops. A device's `bands` entries may change `color` and `weight`, matched by `name`; `from_hz` and `to_hz` are ignored with a warning, because the band energies are computed once for everyone and the boundaries have to stay identical.
 
+## 3D positioning
+
+Normally every light shows the same color at the same moment. Give them positions and they stop agreeing: each one follows the speakers it faces, so a light on the left of the desk answers the left channel and a light behind the couch answers the surrounds.
+
+### The room
+
+The listener sits at the origin, distances are metres, and the axes are:
+
+```
+        +Y up
+         |
+         |      +Z front (toward the screen/speakers)
+         |     /
+         |    /
+  -X ----+---/---- +X right
+        /
+      -Z behind
+```
+
+So `[-2.0, 1.2, 0.5]` is two metres to the left, 1.2 up, half a metre in front of you.
+
+### Getting started
+
+1. Run `--list-devices` and look at the `layout:` line of the output you actually use:
+
+   ```
+   - Kopfhörer (CORSAIR VIRTUOSO Wireless Gaming Headset)
+     id: {0.0.0.00000000}.{b77aed6a-8806-4872-a38b-5d52500a3b1f}
+     layout: 7.1 (FL FR FC LFE BL BR SL SR)
+   ```
+
+   `stereo` gives you a left/right axis. `5.1` or `7.1` gives you front/back as well.
+
+2. Set `spatial.enabled` to `true`.
+3. Give each light a `position` (or a [`path`](#strips-that-bend)) and raise its `spatiality`. Nothing changes until you do: a light with neither keeps the behaviour it had before positions existed.
+
+```json
+{
+  "spatial": { "enabled": true },
+  "devices": [
+    {
+      "type": "shelly", "host": "192.168.178.32",
+      "form": "strip",
+      "position": [-2.0, 1.2, 0.5],
+      "extent":   [ 0.0, 1.0, 0.0],
+      "spatiality": 0.8
+    },
+    {
+      "type": "govee_lan", "ip": "192.168.178.78", "name": "Kitchen",
+      "form": "lamp",
+      "position": [2.2, 1.6, -1.0],
+      "spatiality": 1.0
+    }
+  ]
+}
+```
+
+At startup each positioned light prints what it ended up hearing:
+
+```
+Device: shelly 192.168.178.32
+  bass 20-200Hz #FF0000, mid 200-2000Hz #00FF00, treble 2000-8000Hz #0000FF
+  strip [-2.0, 0.2, 0.5] -> [-2.0, 2.2, 0.5] x0.80, FL 44% SL 21% BL 14%
+```
+
+### Lamps and strips
+
+A `lamp` is a single point. A `strip` is a line: it is sampled at `spatial.strip_samples` points along its length, and those samples are averaged. A straight strip is written as a centre plus a half-vector (`position` + `extent`); one that bends uses [`path`](#strips-that-bend) instead.
+
+That one difference is all there is, and everything else follows from it. A strip covers a region of the room instead of a spot, so it reacts more widely and more smoothly than a lamp in the same place. A floor-to-ceiling strip also spans every height at once, which — see below — means it spans the whole spectrum and ends up close to the global mix, while a lamp at either end of it leans hard into bass or treble.
+
+### Strips that bend
+
+Real strips rarely run in a straight line. One might go up the wall from the floor, turn at the ceiling, and carry on toward the back of the room. Write that as `path` — every corner it passes through, in order:
+
+```json
+{
+  "type": "wled", "host": "192.168.178.90",
+  "leds": 120, "segments": 24,
+  "form": "strip",
+  "path": [
+    [-2.0, 0.0,  1.5],
+    [-2.0, 2.4,  1.5],
+    [ 2.0, 2.4, -2.5]
+  ],
+  "spatiality": 1.0
+}
+```
+
+That is: start on the floor two metres to your left and slightly in front, run 2.4 m straight up the wall, then turn and run along the ceiling to the back right of the room.
+
+Segments are spread along the path **by distance, not by corner**, because that is how the LEDs are spaced. In the example the wall leg is 2.4 m and the ceiling leg 5.7 m, so the ceiling gets a bit over twice as many segments as the wall. Startup prints the shape back so you can check it:
+
+```
+strip [-2.0, 0.0, 1.5] -> [-2.0, 2.4, 1.5] -> [2.0, 2.4, -2.5] (8.1m over 2 legs) x1.00, BR 22% FL 20% SL 19%, 12 segment gradient
+```
+
+`path` replaces `position` and `extent`; setting both warns and uses the path. Two corners is exactly equivalent to a straight `position` + `extent` strip, so there is no reason to use both forms. A `path` with a single corner is just a point.
+
+Where a leg runs affects what varies along it. In the example the wall leg climbs, so it sweeps bass to treble by height; the ceiling leg stays at one height and instead follows the panning as it crosses the room from left to right.
+
+### Gradients on addressable strips
+
+On a light that can only show one color — a Shelly, a Govee bulb — the strip's sample points are averaged down to that single color, and the paragraph above is the whole story.
+
+An **addressable** light ([`wled`](#type-wled), [`govee_dreamview`](#type-govee_dreamview)) instead keeps them apart: it is sampled once per segment, and each segment is colored from where that segment physically is. Nothing extra has to be configured — give the light a `position` and `extent` (or a [`path`](#strips-that-bend)) plus a `spatiality`, and the gradient falls out of the same geometry:
+
+```json
+{
+  "type": "wled", "host": "192.168.178.90",
+  "leds": 120, "segments": 16,
+  "form": "strip",
+  "position": [-2.0, 1.2, 0.5],
+  "extent":   [ 0.0, 1.2, 0.0],
+  "spatiality": 1.0
+}
+```
+
+- A **vertical** strip has no left/right spread, so its gradient comes from the height mapping: bass at the bottom, treble at the top.
+- A **horizontal** strip across the room picks up the panning instead: its left end follows the left channel, its right end the right.
+- Without a `position` or a `path` there is nothing to vary along the strip, so every segment gets the same color and the strip behaves like any other light.
+
+`segments` is how many colors the strip shows, not how many LEDs it has. On WLED the pixels are divided evenly between them, so 120 LEDs with `segments: 16` gives runs of 7 or 8 pixels. More segments mean a smoother gradient and a slightly larger packet; the whole strip still goes out in one UDP write.
+
+### Height and frequency
+
+Left/right and front/back come from the audio itself. Height usually cannot: a stereo or 5.1 device carries no height information whatsoever.
+
+So height is mapped onto **frequency** instead. A light near the floor leans toward the bass bands, one near the ceiling toward the treble bands, scaled across `spatial.room`'s `min.y` to `max.y`. `height_sharpness` controls how narrowly a height picks its bands.
+
+If your layout does have height speakers, this stand-in is unnecessary and switches itself off. That is what `elevation_tilt: null` means: `1.0` when the layout has no height channels, `0.0` when it has. Set it to a number to decide yourself.
+
+Note that this only shifts a light's *hue*. Brightness still comes from the overall level, so a floor light does not go dark just because the music has no bass.
+
+### Tuning
+
+- **The lights barely differ:** raise `spatiality` toward `1.0`, raise `focus`, and lower `omni_floor`. Also check that the music is actually panned — a mono master will look identical everywhere no matter what you configure.
+- **A light is too isolated or goes dark:** lower `focus` or raise `omni_floor`.
+- **Only left/right responds:** your output device is stereo. Check the `layout:` line from `--list-devices`.
+- **The colors drifted after adding positions:** that is the height mapping. Set `elevation_tilt: 0.0` on a light to keep its position purely horizontal.
+- **An addressable strip shows one flat color:** it has no `position` or `path`, or its `spatiality` is still `0.0`. Without those there is nothing to vary along its length. Check the startup line — a strip that will show a gradient says so: `12 segment gradient`.
+- **A WLED strip drops back to its own effect while music plays:** `realtime_timeout_s` is shorter than the gap between packets. Raise it, or lower `output.change_interval_ms` so frames arrive more often.
+- **Part of a bent strip does not change color:** a leg that stays at one height has no bass-to-treble sweep along it, only whatever panning crosses it. Check the shape printed at startup against how the strip really runs.
+- **A Govee strip ignores `segments`:** expected on most models — see the note under [`govee_dreamview`](#type-govee_dreamview). Set `segments: 1`.
+
 ## Upgrading from an older config
 
 Older versions kept `change_interval_ms`, `audio_device`, `transition_min_ms`, `transition_max_ms`, `beat_threshold` and `strobe_ms` at the top level, and lights in `shellys[]` / `govees[]`. Both layouts are migrated automatically on the first start: your values move into the new sections, the old keys disappear, and the new sections appear with their defaults. Nothing needs to be edited by hand.
@@ -327,9 +573,16 @@ Older versions kept `change_interval_ms`, `audio_device`, `transition_min_ms`, `
 
 The `audio.apps` block is new and appears with `enabled: false`, so an existing config keeps capturing the output device until you turn it on.
 
+The `spatial` block is new and also appears with `enabled: false`. Your existing `devices[]` entries are left untouched — they gain no position keys — and every light keeps following the global mix until you add a `position` or a `path` and raise its `spatiality`. See [3D positioning](#3d-positioning).
+
 ## Troubleshooting
 
 - **No audio detected:** check that `audio.device` points at the output you actually play through. Run with `--list-devices` to have every device listed.
+- **Linux: the lights follow your microphone:** no monitor source was found, so a plain input was taken instead — the startup log says so. Check that PulseAudio or PipeWire is running with `pactl info`, then re-run `--list-devices` and look for an entry marked `[system output]`.
+- **Linux: `--list-devices` shows no monitor source:** cpal fell back to ALSA, which cannot see one. Install or start PipeWire or PulseAudio, or configure an `snd-aloop` device by hand.
+- **Linux: the build fails on `alsa-sys`:** the ALSA headers are missing. `sudo apt install libasound2-dev` or `sudo dnf install alsa-lib-devel`.
+- **macOS: nothing is captured:** macOS has no loopback of its own; a virtual audio driver has to be installed and selected. See [Capturing on macOS](#capturing-on-macos).
+- **macOS: the audio goes silent when you select the virtual device:** that device is not connected to your speakers. Use a Multi-Output Device that contains both, as described in [Capturing on macOS](#capturing-on-macos).
 - **A selected app does not drive the lights:** run `--list-apps` while it plays and use the name it prints there. An app is only found once its process runs, so give it up to `audio.apps.rescan_ms`. "System sounds" cannot be captured at all.
 - **App capture fails on start:** per-process capture needs Windows 10 version 2004 or newer. Older builds only support `audio.device`.
 - **Light is not responding:** check `host` / `ip` and that your computer can reach it. A device that cannot be reached at startup aborts the program with the underlying error.

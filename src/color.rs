@@ -1,7 +1,7 @@
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 // ---------------------------------------------------------------- Rgbw
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rgbw {
     pub r: u8,
     pub g: u8,

@@ -1,19 +1,10 @@
-//! Device abstraction and auto-registration.
-//!
-//! Every `*.rs` file in this directory (except `mod.rs`) is picked up by `build.rs` and registered as a device type. A new device therefore only
-//! needs a new file here that exposes:
-//! ```ignore
-//! pub const DESCRIPTOR: DeviceDescriptor = DeviceDescriptor { .. };
-//! ```
-//! No other file has to be touched - not `mod.rs`, not `config.rs`, not `main.rs`.
-//!
-//! The per-device color override is parsed here rather than in the device files, so a new device inherits it for free.
-
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 
-use crate::color::{BandConfig, ColorEngine, ColorMapConfig};
+use crate::color::{BandConfig, ColorEngine, ColorMapConfig, Rgbw};
+use crate::config::SpatialSection;
+use crate::spatial::{DeviceSpatial, DeviceSpatialConfig, SpeakerLayout};
 
 include!(concat!(env!("OUT_DIR"), "/device_registry.rs"));
 
@@ -31,27 +22,39 @@ pub trait Device: Send + Sync {
     fn name(&self) -> String;
     fn apply(&self, frame: &Frame) -> Result<()>;
     fn restore(&self) -> Result<()>;
+    fn segment_count(&self) -> usize {
+        1
+    }
+    fn apply_segments(&self, frame: &Frame, _segments: &[Rgbw]) -> Result<()> {
+        self.apply(frame)
+    }
 }
 
-/// A built device plus the color mapping it wants. `engine` is `None` for the common case of following the global mapping.
 pub struct RuntimeDevice {
     pub inner: Box<dyn Device>,
     pub engine: Option<Arc<ColorEngine>>,
+    pub spatial: Option<DeviceSpatial>,
 }
 
 impl RuntimeDevice {
     pub fn name(&self) -> String {
         self.inner.name()
     }
-    pub fn apply(&self, frame: &Frame) -> Result<()> {
-        self.inner.apply(frame)
+    pub fn segment_count(&self) -> usize {
+        self.inner.segment_count().max(1)
+    }
+    pub fn apply(&self, frame: &Frame, segments: &[Rgbw]) -> Result<()> {
+        if self.segment_count() > 1 && !segments.is_empty() {
+            self.inner.apply_segments(frame, segments)
+        } else {
+            self.inner.apply(frame)
+        }
     }
     pub fn restore(&self) -> Result<()> {
         self.inner.restore()
     }
 }
 
-/// Static description of a device type, used to build devices from config and to migrate legacy config layouts.
 pub struct DeviceDescriptor {
     pub type_tag: &'static str, // Value of the `type` field in a `devices[]` entry of `config.json`.
     pub legacy_key: Option<&'static str>, // Top level array this device type used to live in before the unified `devices` array existed (e.g. `"shellys"`). `None` if there is none.
@@ -67,6 +70,12 @@ pub fn default_entry(desc: &DeviceDescriptor) -> Value {
     let mut v = (desc.default_config)();
     if let Some(obj) = v.as_object_mut() {
         obj.insert("type".to_string(), Value::String(desc.type_tag.to_string()));
+        let geometry = DeviceSpatialConfig::default();
+        obj.insert("form".to_string(), serde_json::to_value(geometry.form).expect("serialize device form"));
+        obj.insert("position".to_string(), Value::Null);
+        obj.insert("extent".to_string(), serde_json::to_value(geometry.extent).expect("serialize device extent"));
+        obj.insert("path".to_string(), Value::Null);
+        obj.insert("spatiality".to_string(), serde_json::to_value(geometry.spatiality).expect("serialize device spatiality"));
     }
     v
 }
@@ -74,7 +83,7 @@ pub fn default_entries() -> Vec<Value> {
     REGISTRY.iter().filter(|d| d.in_default_config).map(default_entry).collect()
 }
 
-pub fn build_all(entries: &[Value], bands: &[BandConfig], global_map: &ColorMapConfig, warnings: &mut Vec<String>) -> Result<Vec<RuntimeDevice>> {
+pub fn build_all(entries: &[Value], bands: &[BandConfig], global_map: &ColorMapConfig, spatial: &SpatialSection, layout: &SpeakerLayout, warnings: &mut Vec<String>) -> Result<Vec<RuntimeDevice>> {
     let mut devices = Vec::with_capacity(entries.len());
     for entry in entries {
         let tag = entry.get("type").and_then(|v| v.as_str()).context("device config entry is missing the \"type\" field")?;
@@ -85,12 +94,23 @@ pub fn build_all(entries: &[Value], bands: &[BandConfig], global_map: &ColorMapC
         };
         let inner = (desc.build)(entry).with_context(|| format!("build device {tag:?}"))?;
         let engine = device_engine(entry, bands, global_map, tag, warnings)?;
-        devices.push(RuntimeDevice { inner, engine });
+        let geometry = device_spatial(entry, tag, warnings);
+        let points = inner.segment_count().max(1);
+        devices.push(RuntimeDevice { inner, engine, spatial: DeviceSpatial::build(&geometry, layout, bands, spatial, points, tag, warnings) });
     }
     Ok(devices)
 }
 
-/// Builds a color engine for one device, but only if that device actually overrides something.
+fn device_spatial(entry: &Value, tag: &str, warnings: &mut Vec<String>) -> DeviceSpatialConfig {
+    match serde_json::from_value::<DeviceSpatialConfig>(entry.clone()) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warnings.push(format!("device {tag:?}: unusable position settings ({e}), it will follow the global mix"));
+            DeviceSpatialConfig::default()
+        }
+    }
+}
+
 fn device_engine(entry: &Value, bands: &[BandConfig], global_map: &ColorMapConfig, tag: &str, warnings: &mut Vec<String>) -> Result<Option<Arc<ColorEngine>>> {
     let map_override = entry.get("color_map");
     let band_override = entry.get("bands");
@@ -132,8 +152,6 @@ fn overlay(base: &mut Value, patch: &Value) {
     }
 }
 
-/// A device may recolor or reweight the global bands, but not move their edges: the band energies are computed once, globally, so the index
-/// order has to stay the same for everyone.
 fn override_bands(global: &[BandConfig], patch: &Value, tag: &str, warnings: &mut Vec<String>) -> Vec<BandConfig> {
     let Some(list) = patch.as_array() else {
         warnings.push(format!("device {tag:?}: \"bands\" must be an array, ignoring it"));
@@ -180,8 +198,6 @@ fn override_bands(global: &[BandConfig], patch: &Value, tag: &str, warnings: &mu
     }
     out
 }
-
-// ---------------------------------------------------------------- brightness
 
 #[derive(Debug, Clone, Copy)]
 pub struct BrightnessLimits {

@@ -19,9 +19,13 @@ use windows::{
     },
 };
 
-use crate::audio::{cast_slice, downmix};
+use crate::audio::cast_slice;
 use crate::capture::{AppInfo, AppTarget, CaptureStream};
-use crate::config::{AppGroup, AppMatchMode, AppsSection, AudioDeviceSelector, AudioSection, Downmix};
+use crate::config::{AppGroup, AppMatchMode, AppsSection, AudioDeviceSelector, AudioSection};
+use crate::spatial::SpeakerLayout;
+
+/// Windows can loop back one process at a time, which is what `audio.apps` uses.
+pub const APP_CAPTURE_SUPPORTED: bool = true;
 
 const STILL_RUNNING: u32 = 259; // STILL_ACTIVE, the exit code of a process that has not exited.
 const READ_TIMEOUT_MS: u32 = 100; // Kept short so a capture thread notices Ctrl+C quickly.
@@ -33,7 +37,7 @@ struct WasapiStream {
     channels: usize,
     bytes_per_frame: usize,
     sample_rate: f32,
-    downmix: Downmix,
+    channel_mask: u32,
     raw: Vec<u8>,
 }
 
@@ -42,7 +46,11 @@ impl CaptureStream for WasapiStream {
         self.sample_rate
     }
 
-    fn read_mono(&mut self, out: &mut Vec<f32>) -> Result<usize> {
+    fn layout(&self) -> SpeakerLayout {
+        SpeakerLayout::from_channel_mask(self.channel_mask, self.channels)
+    }
+
+    fn read_frames(&mut self, out: &mut Vec<f32>) -> Result<usize> {
         if self.event.wait_for_event(READ_TIMEOUT_MS).is_err() {
             return Ok(0); // Nothing was delivered in time. Silence is decided further up.
         }
@@ -61,13 +69,13 @@ impl CaptureStream for WasapiStream {
                 break;
             }
             let floats: &[f32] = cast_slice(&self.raw[..read_frames as usize * self.bytes_per_frame]);
-            out.extend(floats.chunks_exact(self.channels).map(|frame| downmix(frame, self.downmix)));
+            out.extend_from_slice(floats);
         }
-        Ok(out.len() - before)
+        Ok((out.len() - before) / self.channels.max(1))
     }
 }
 
-fn stream_from(client: AudioClient, format: &WaveFormat, downmix_mode: Downmix) -> Result<Box<dyn CaptureStream>> {
+fn stream_from(client: AudioClient, format: &WaveFormat) -> Result<Box<dyn CaptureStream>> {
     let capture = client.get_audiocaptureclient()?;
     let event = client.set_get_eventhandle()?;
     client.start_stream()?;
@@ -79,7 +87,7 @@ fn stream_from(client: AudioClient, format: &WaveFormat, downmix_mode: Downmix) 
         channels,
         bytes_per_frame: channels * size_of::<f32>(),
         sample_rate: format.get_samplespersec().max(1) as f32,
-        downmix: downmix_mode,
+        channel_mask: format.get_dwchannelmask(),
         raw: Vec::new(),
         _client: client,
     }))
@@ -113,7 +121,7 @@ pub fn open_device(sel: &AudioDeviceSelector, audio: &AudioSection) -> Result<Bo
     let format = client.get_mixformat()?;
     let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: audio.buffer_duration_hns };
     client.initialize_client(&format, &Direction::Capture, &mode)?;
-    stream_from(client, &format, audio.downmix)
+    stream_from(client, &format)
 }
 
 pub fn list_devices() {
@@ -135,9 +143,15 @@ fn list_render_devices(enumerator: &DeviceEnumerator) {
             let Ok(dev) = dev_res else { continue };
             let name = dev.get_friendlyname().unwrap_or_else(|_| "<no name>".to_string());
             let id = dev.get_id().unwrap_or_else(|_| "<no id>".to_string());
-            eprintln!("  - {name}\n    id: {id}");
+            eprintln!("  - {name}\n    id: {id}\n    layout: {}", describe_layout_of(&dev));
         }
     }
+}
+
+fn describe_layout_of(dev: &Device) -> String {
+    let Ok(client) = dev.get_iaudioclient() else { return "unknown".to_string() };
+    let Ok(format) = client.get_mixformat() else { return "unknown".to_string() };
+    SpeakerLayout::from_channel_mask(format.get_dwchannelmask(), format.get_nchannels() as usize).describe()
 }
 
 fn select_render_device(enumerator: &DeviceEnumerator, sel: &AudioDeviceSelector) -> Result<Device> {
@@ -165,7 +179,7 @@ pub fn open_app(target: &AppTarget, audio: &AudioSection) -> Result<Box<dyn Capt
     let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: 0 };
     client.initialize_client(&format, &Direction::Capture, &mode)?;
 
-    stream_from(client, &format, audio.downmix)
+    stream_from(client, &format)
 }
 
 pub fn process_alive(pid: u32) -> bool {

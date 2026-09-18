@@ -5,6 +5,7 @@ use std::{fs, path::Path};
 
 use crate::color::{default_bands, BandConfig, ColorMapConfig, Rgbw};
 use crate::devices;
+use crate::spatial::{SpeakerRole, Vec3};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -18,6 +19,8 @@ pub struct AppConfig {
     pub dynamics: DynamicsSection,
     #[serde(default)]
     pub output: OutputSection,
+    #[serde(default)]
+    pub spatial: SpatialSection,
     #[serde(default = "devices::default_entries")]
     pub devices: Vec<Value>,
 }
@@ -30,6 +33,7 @@ impl Default for AppConfig {
             color_map: ColorMapConfig::default(),
             dynamics: DynamicsSection::default(),
             output: OutputSection::default(),
+            spatial: SpatialSection::default(),
             devices: devices::default_entries(),
         }
     }
@@ -325,6 +329,69 @@ impl Default for OutputSection {
             brightness_floor: d_brightness_floor(),
             gamma_min: d_gamma_min(),
             gamma_max: d_gamma_max(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- spatial
+
+/// Which speaker sits on which capture channel.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutSelector {
+    #[default]
+    Auto, // Decoded from the channel mask the audio backend reports.
+    Channels(Vec<SpeakerRole>), // Stated by hand, one entry per capture channel, in interleaved order.
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RoomBounds {
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
+impl Default for RoomBounds {
+    fn default() -> Self {
+        Self { min: Vec3::new(-3.0, 0.0, -3.0), max: Vec3::new(3.0, 3.0, 3.0) }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpatialSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub layout: LayoutSelector,
+    #[serde(default)]
+    pub room: RoomBounds, // Normalizes a device's height into the band spectrum. Only `min.y`/`max.y` are read today.
+    #[serde(default = "d_focus")]
+    pub focus: f32, // Exponent on the direction match. Higher values aim a light more tightly at the speakers it faces.
+    #[serde(default = "d_omni_floor")]
+    pub omni_floor: f32, // Share of the audio every device hears regardless of direction, so a hard left light never loses the right channel completely.
+    #[serde(default = "d_strip_samples")]
+    pub strip_samples: usize, // How many points a `strip` device is sampled at along its segment.
+    #[serde(default = "d_height_sharpness")]
+    pub height_sharpness: f32, // Width of the height-to-frequency match. Smaller values tie a height to fewer bands.
+    #[serde(default)]
+    pub distance_falloff: f32, // Brightness lost per metre of distance from the listener. `0.0` keeps every light equally bright.
+}
+
+fn d_focus() -> f32 { 2.0 }
+fn d_omni_floor() -> f32 { 0.15 }
+fn d_strip_samples() -> usize { 8 }
+fn d_height_sharpness() -> f32 { 0.35 }
+
+impl Default for SpatialSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            layout: LayoutSelector::default(),
+            room: RoomBounds::default(),
+            focus: d_focus(),
+            omni_floor: d_omni_floor(),
+            strip_samples: d_strip_samples(),
+            height_sharpness: d_height_sharpness(),
+            distance_falloff: 0.0,
         }
     }
 }
