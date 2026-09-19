@@ -8,6 +8,7 @@ A Rust application that synchronizes RGBW lights with your computer's audio outp
 - **Shelly:** Gen1 (RGBW2) and Gen2 (Plus RGBW PM), with automatic API detection and optional authentication.
 - **Govee LAN:** local UDP control, no cloud account, with an optional DreamView mode that lifts the light's rate limiting.
 - **WLED:** driven over the UDP realtime protocol, with a real gradient along the strip.
+- **Philips Hue:** local control over the bridge's CLIP v2 API, paired from the settings window. Several lights in one entry act as the segments of one strip.
 - **Addressable strips:** a positioned strip is colored per segment, so bass can sit at one end and treble at the other instead of the whole strip showing one color.
 - **Fully configurable frequency to color mapping:** you decide which color sits at which frequency; frequencies in between are interpolated.
 - **Free frequency bands:** any number, any boundaries, individually weighted and optionally individually colored.
@@ -17,36 +18,57 @@ A Rust application that synchronizes RGBW lights with your computer's audio outp
 - **Everything else is configurable too:** FFT size and overlap, window function, smoothing, beat detection, strobe, transitions, silence handling, network timeouts.
 - **Smart throttling:** deduplicates and rate-limits network traffic so the lights stay responsive.
 - **State restoration:** puts the lights back the way it found them on exit.
+- **Tray application:** lives in the notification area with a status line, pause, reload and quit, and a settings window that edits every option below without touching JSON by hand.
 
-Runs on Windows, Linux and macOS. Everything except the audio capture is platform independent; capture sits behind one small boundary in `src/capture/`, with a WASAPI backend on Windows and a [cpal](https://github.com/RustAudio/cpal) one on Linux and macOS.
+Runs on Windows, Linux and macOS. Everything except the audio capture is platform independent; capture sits behind one small boundary in `src-tauri/src/capture/`, with a WASAPI backend on Windows and a [cpal](https://github.com/RustAudio/cpal) one on Linux and macOS.
+
+## Layout
+
+The standard [Tauri](https://v2.tauri.app) layout: the frontend at the root, the Rust in `src-tauri/`.
+
+| Path | What it is |
+|---|---|
+| `src/` | The settings window — React and TypeScript, built by Vite. Run `pnpm dev` on its own and it opens in an ordinary browser against the mock answers in `src/devMocks.ts`, which is the quickest way to work on the interface. |
+| `src/locales/` | The interface text. `en.json` is the base — every key lives there, and a translation that has not caught up falls back to it. German is `de_DE.json`. |
+| `src/types/` | TypeScript declarations generated from the Rust config structs. Regenerate with `pnpm types` after changing any of them. |
+| `src-tauri/src/` | The application: `lib.rs`, `commands.rs`, `tray.rs`, `paths.rs`. |
+| `src-tauri/src/engine.rs` + `capture/`, `devices/`, `analysis.rs`, `color.rs`, `config.rs`, `spatial.rs` | The engine. Knows nothing about Tauri and runs entirely on threads `Engine` owns, which is what keeps the pipeline off the thread the window's event loop needs. |
+| `src-tauri/windows/installer.nsi` | A fork of Tauri's NSIS script, adding the page that asks where `config.json` should live. |
 
 ## Installation
 
-1. Install [Rust](https://www.rust-lang.org/tools/install).
+1. Install [Rust](https://www.rust-lang.org/tools/install) and [Node](https://nodejs.org) with [pnpm](https://pnpm.io).
 2. Clone this repository.
 3. Install the build dependencies for your platform:
-   - **Windows** — none.
-   - **Linux** — the ALSA headers, which cpal needs to build: `sudo apt install libasound2-dev` (Debian/Ubuntu) or `sudo dnf install alsa-lib-devel` (Fedora).
-   - **macOS** — none to build, but see [Capturing on macOS](#capturing-on-macos) before running.
+   - **Windows** — none. WebView2 ships with Windows 11.
+   - **Linux** — the ALSA headers, which cpal needs to build: `sudo apt install libasound2-dev` (Debian/Ubuntu) or `sudo dnf install alsa-lib-devel` (Fedora), plus the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+   - **macOS** — Xcode command line tools, and see [Capturing on macOS](#capturing-on-macos) before running.
 4. Build:
    ```bash
-   cargo build --release
+   pnpm install
+   pnpm tauri build     # installer in target/release/bundle/
+   ```
+
+   Or, to run it without packaging:
+   ```bash
+   pnpm tauri dev
    ```
 
 ### Capturing the system audio
 
 Windows can record an output device directly. Linux and macOS cannot: what they offer is a *capture* device that happens to carry the output, and the two platforms differ in where it comes from.
 
-Run `--list-devices` on any platform to see what is available; on Linux and macOS the usable ones are marked `[system output]`.
+The **Audio** tab lists what is available; on Linux and macOS the usable ones are the monitor or virtual devices described below.
 
 #### Capturing on Linux
 
 PulseAudio and PipeWire give every output a matching **monitor source**, and that is what gets recorded. Nothing has to be set up: leave `audio.device` on its default and the monitor is found automatically.
 
+The device dropdown looks roughly like this; the `.monitor` entry is the one that carries the output:
+
 ```
---- Capture devices (usable in audio.device) ---
-  - alsa_input.pci-0000_00_1f.3.analog-stereo  [default input]
-  - alsa_output.pci-0000_00_1f.3.analog-stereo.monitor  [system output]
+alsa_input.pci-0000_00_1f.3.analog-stereo            (Standard)
+alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
 ```
 
 PipeWire works through its `pipewire-pulse` compatibility layer, which every desktop that ships PipeWire also ships. On a machine running neither, capture falls back to ALSA, which can only see real recording hardware — there will be no `[system output]` entry, and a loopback device has to be set up by hand with `snd-aloop`.
@@ -68,18 +90,41 @@ macOS asks for microphone permission the first time the program records; it has 
 
 ## Running
 
-```bash
-cargo run --release                   # uses ./config.json
-cargo run --release -- my-setup.json  # explicit path
-cargo run --release -- --list-devices # print the capture devices (with speaker layouts on Windows), then exit
-cargo run --release -- --list-apps    # print the applications, then exit
-```
+The application starts into the notification area and begins capturing straight away — no window opens until you ask for one.
 
-The config file can also be pointed at with the `SHELLYRGBAUDIO_CONFIG` environment variable. On the first run, the file is created by default; adjust it and restart.
+**The tray menu**
 
-The config is rewritten on every start, so any option added by a new version shows up in your file automatically, already filled with its default. Your own values are kept. If the file cannot be parsed, a copy is saved next to it as `config.json.bak` before defaults are written.
+| Entry | What it does |
+|---|---|
+| *(status line)* | What the engine is doing: sample rate, speaker layout, number of devices. Not clickable. |
+| **Pause** / **Resume** | Stops the pipeline and puts the lights back where they were; resuming builds everything again from the file. |
+| **Settings…** | Opens the settings window. A left click on the tray icon does the same. |
+| **Reload** | Restores the lights, then rebuilds capture, analysis and devices from the config on disk. |
+| **Quit** | Restores the lights and exits. |
 
-At startup the program prints which color each band resolved to, so you can check a color map without playing anything:
+Closing the settings window only hides it; the engine keeps running. **Quit** is the way out.
+
+**The settings window** edits everything documented under [Configuration reference](#configuration-reference), with the audio device and the running applications read live from the system. Saving writes the file; *Save & reload* also restarts the engine so the change takes effect immediately.
+
+**Language.** English by default, German available, and "follow the system" picks between them from the OS locale. The setting is under **Advanced** and covers the window and the tray menu; the engine's log stays English, because it is diagnostic output that ends up in bug reports and is more useful when everyone's copy reads the same. Adding a language means one more file in `src/locales/`, a line in `LANGUAGES` in `src/i18n.ts`, and — if the tray should speak it too — a column in `src-tauri/src/i18n.rs`.
+
+**Placing the lights** happens under **Room**. The room view draws the room, the speakers the engine is actually weighting against, and every positioned light; dragging the handle moves one, and the *Drehen* mode turns a strip. A strip is stated as a **length** and two angles rather than the half-vector the config stores — 1.4 metres running up the wall, not `[0, 0.7, 0]` — and the two representations are kept in step, so typing a length and dragging in the view are the same edit seen from two sides. **Around the corner** turns a straight strip into a corner list ([`path`](#strips-that-bend)): every corner then gets a ball of its own in the view that can be dragged where the strip really turns, the marker in the middle moves the whole strip, and *Begradigen* in the form takes it back to a straight line. A bent strip has one direction per run rather than one overall, so *Drehen* works per run: click the run you mean and the strip hinges at the corner it starts from, carrying everything after it along. The form states the same thing as a length and two angles per run.
+
+### Where the config lives
+
+The first of these that answers wins:
+
+1. `--config <path>` on the command line
+2. the `SHELLYRGBAUDIO_CONFIG` environment variable
+3. `config_path` in `%APPDATA%\eu.sytxlabs.shellyrgbaudio\app.json` — written by the installer's location page, and by the **Advanced** tab
+4. a `config.json` next to the executable, for a portable copy
+5. `%APPDATA%\eu.sytxlabs.shellyrgbaudio\config.json`
+
+The installer asks for the location during setup, and `ShellyRGBAudio_x64-setup.exe /S /CONFIGPATH=D:\somewhere\config.json` sets it for an unattended install.
+
+Reading the config migrates older layouts forward and fills in any option a new version added, but nothing is written back until you save. A file that cannot be parsed is copied to `config.json.bak` and the window says so; **the original is left alone**, so a single mistyped value cannot cost you the file.
+
+At startup the engine logs which colour each band resolved to, visible under **Status**, so a colour map can be checked without playing anything:
 
 ```
 Device: shelly 192.168.178.32
@@ -182,7 +227,7 @@ Three, six, or eight hex digits; the last pair is the white channel. Both forms 
 ### `audio.apps`
 
 Instead of everything that leaves the output device, the lights can follow single applications, the
-same ones the Windows volume mixer lists. `--list-apps` prints what can be picked:
+same ones the Windows volume mixer lists. the **Applications** tab lists what can be picked:
 
 ```
 --- Applications (usable in audio.apps.groups[].apps) ---
@@ -201,8 +246,8 @@ analysis; a group exists to organize the patterns and to give them their own `ga
 | `mode`                 | `"include"` | `include` follows the listed apps, `exclude` follows everything except them.                                              |
 | `include_process_tree` | `true`      | Also capture the child processes of a matched app, even when their executable is named differently.                       |
 | `rescan_ms`            | `3000`      | How often the running applications are rechecked, so an app that starts or restarts later is picked up.                   |
-| `sample_rate`          | `48000`     | Capture format. Per-app capture cannot ask the system for a mix format, so it has to be stated. Windows converts for you. |
-| `channels`             | `2`         | Same, for the channel count.                                                                                              |
+| `sample_rate`          | `null`      | Capture format. Per-app capture has no mix format of its own to ask for, so `null` takes the output device's rate. A number states one instead and Windows converts for you. |
+| `channels`             | `null`      | Same, for the channel count: `null` records in as many channels as the output device runs in, with its speaker mask, so a 7.1 output stays 7.1 and [3D positioning](#3d-positioning) keeps working while capturing single apps. A number pins it — `2` on a 7.1 output is what makes the status line read `stereo (FL FR)`, and startup says so. |
 | `groups`               | `[]`        | The app groups, see below.                                                                                                |
 
 Each group takes a `name` (free text, and reserved for routing a group to one light later), an
@@ -376,6 +421,24 @@ Driven over WLED's UDP realtime protocol on port 21324, which is low latency and
 
 > The realtime protocol carries no brightness field, so `min_brightness` / `max_brightness` / `brightness_gamma` are multiplied into the pixel values before sending. Nothing has to be restored by hand: the `realtime_timeout_s` countdown hands the strip back to whatever effect it was running, and only the brightness and power WLED reported at startup are written back.
 
+#### `type: "hue"`
+
+Philips Hue over the bridge's local CLIP v2 API. No cloud account: the bridge is talked to directly, and pairing is a button press on the bridge itself. **Addressable:** name several lights in one entry and they act as the segments of one strip, colored in the order they are listed.
+
+| Setting                 | Default          | Description                                                                                                      |
+|-------------------------|------------------|------------------------------------------------------------------------------------------------------------------|
+| `bridge`                | `192.168.1.80`   | IP address or hostname of the bridge.                                                                            |
+| `application_key`       | `""`             | What the bridge hands out when pairing. The **Pair** button in the settings window fills this in.                 |
+| `lights`                | `[]`             | Resource ids of the `light` resources to drive, in the order they stand in the room. The settings window lists them by name. |
+| `max_updates_per_second`| `10`             | The bridge forwards roughly ten commands a second per light. Frames that arrive faster are skipped; the newest one is sent. |
+| `transitions`           | `true`           | Passes the fade the engine asks for on to the light. `false` makes every change a jump, which follows the beat more closely. |
+| `http_timeout_ms`       | `2000`           | Per-request timeout.                                                                                             |
+| `verify_tls`            | `false`          | A bridge signs its certificate itself, so verification is off by default. Turn it on only if the bridge carries a certificate your system trusts. |
+
+Pairing: press the round button on the bridge, then **Pair** in the device's form within half a minute. The key stays valid, so this is done once per bridge.
+
+> A Hue light is told a chromaticity plus a brightness rather than an RGB triple, so the bright-dark part of a color is sent as `dimming` instead of being folded into the color. Frames are sent from a thread of their own, so a slow or unreachable bridge never holds up the other lights. State is restored on exit: on/off, brightness and the color or colour temperature each light had at startup.
+
 #### `type: "govee_dreamview"`
 
 A Govee strip driven in DreamView / Razer mode, with an attempt at addressing its segments individually.
@@ -439,7 +502,7 @@ So `[-2.0, 1.2, 0.5]` is two metres to the left, 1.2 up, half a metre in front o
 
 ### Getting started
 
-1. Run `--list-devices` and look at the `layout:` line of the output you actually use:
+1. Open the **Audio** tab and look at the layout shown next to the output you actually use:
 
    ```
    - Kopfhörer (CORSAIR VIRTUOSO Wireless Gaming Headset)
@@ -513,7 +576,7 @@ Segments are spread along the path **by distance, not by corner**, because that 
 strip [-2.0, 0.0, 1.5] -> [-2.0, 2.4, 1.5] -> [2.0, 2.4, -2.5] (8.1m over 2 legs) x1.00, BR 22% FL 20% SL 19%, 12 segment gradient
 ```
 
-`path` replaces `position` and `extent`; setting both warns and uses the path. Two corners is exactly equivalent to a straight `position` + `extent` strip, so there is no reason to use both forms. A `path` with a single corner is just a point.
+The settings window writes this for you: pick the strip under **Room**, press **Around the corner**, and drag the corner balls where the strip really turns. `path` replaces `position` and `extent`; setting both warns and uses the path. Two corners is exactly equivalent to a straight `position` + `extent` strip, so there is no reason to use both forms. A `path` with a single corner is just a point.
 
 Where a leg runs affects what varies along it. In the example the wall leg climbs, so it sweeps bass to treble by height; the ceiling leg stays at one height and instead follows the panning as it crosses the room from left to right.
 
@@ -521,7 +584,7 @@ Where a leg runs affects what varies along it. In the example the wall leg climb
 
 On a light that can only show one color — a Shelly, a Govee bulb — the strip's sample points are averaged down to that single color, and the paragraph above is the whole story.
 
-An **addressable** light ([`wled`](#type-wled), [`govee_dreamview`](#type-govee_dreamview)) instead keeps them apart: it is sampled once per segment, and each segment is colored from where that segment physically is. Nothing extra has to be configured — give the light a `position` and `extent` (or a [`path`](#strips-that-bend)) plus a `spatiality`, and the gradient falls out of the same geometry:
+An **addressable** light ([`wled`](#type-wled), [`govee_dreamview`](#type-govee_dreamview), or a [`hue`](#type-hue) entry with several lights) instead keeps them apart: it is sampled once per segment, and each segment is colored from where that segment physically is. Nothing extra has to be configured — give the light a `position` and `extent` (or a [`path`](#strips-that-bend)) plus a `spatiality`, and the gradient falls out of the same geometry:
 
 ```json
 {
@@ -554,7 +617,7 @@ Note that this only shifts a light's *hue*. Brightness still comes from the over
 
 - **The lights barely differ:** raise `spatiality` toward `1.0`, raise `focus`, and lower `omni_floor`. Also check that the music is actually panned — a mono master will look identical everywhere no matter what you configure.
 - **A light is too isolated or goes dark:** lower `focus` or raise `omni_floor`.
-- **Only left/right responds:** your output device is stereo. Check the `layout:` line from `--list-devices`.
+- **Only left/right responds:** your output device is stereo. Check the layout shown in the **Audio** tab.
 - **The colors drifted after adding positions:** that is the height mapping. Set `elevation_tilt: 0.0` on a light to keep its position purely horizontal.
 - **An addressable strip shows one flat color:** it has no `position` or `path`, or its `spatiality` is still `0.0`. Without those there is nothing to vary along its length. Check the startup line — a strip that will show a gradient says so: `12 segment gradient`.
 - **A WLED strip drops back to its own effect while music plays:** `realtime_timeout_s` is shorter than the gap between packets. Raise it, or lower `output.change_interval_ms` so frames arrive more often.
@@ -577,13 +640,13 @@ The `spatial` block is new and also appears with `enabled: false`. Your existing
 
 ## Troubleshooting
 
-- **No audio detected:** check that `audio.device` points at the output you actually play through. Run with `--list-devices` to have every device listed.
-- **Linux: the lights follow your microphone:** no monitor source was found, so a plain input was taken instead — the startup log says so. Check that PulseAudio or PipeWire is running with `pactl info`, then re-run `--list-devices` and look for an entry marked `[system output]`.
-- **Linux: `--list-devices` shows no monitor source:** cpal fell back to ALSA, which cannot see one. Install or start PipeWire or PulseAudio, or configure an `snd-aloop` device by hand.
+- **No audio detected:** check that `audio.device` points at the output you actually play through. The **Audio** tab lists every device.
+- **Linux: the lights follow your microphone:** no monitor source was found, so a plain input was taken instead — the startup log says so. Check that PulseAudio or PipeWire is running with `pactl info`, then look in the **Audio** tab for a monitor device.
+- **Linux: no monitor source is listed:** cpal fell back to ALSA, which cannot see one. Install or start PipeWire or PulseAudio, or configure an `snd-aloop` device by hand.
 - **Linux: the build fails on `alsa-sys`:** the ALSA headers are missing. `sudo apt install libasound2-dev` or `sudo dnf install alsa-lib-devel`.
 - **macOS: nothing is captured:** macOS has no loopback of its own; a virtual audio driver has to be installed and selected. See [Capturing on macOS](#capturing-on-macos).
 - **macOS: the audio goes silent when you select the virtual device:** that device is not connected to your speakers. Use a Multi-Output Device that contains both, as described in [Capturing on macOS](#capturing-on-macos).
-- **A selected app does not drive the lights:** run `--list-apps` while it plays and use the name it prints there. An app is only found once its process runs, so give it up to `audio.apps.rescan_ms`. "System sounds" cannot be captured at all.
+- **A selected app does not drive the lights:** open the **Applications** tab while it plays and use the name listed there. An app is only found once its process runs, so give it up to `audio.apps.rescan_ms`. "System sounds" cannot be captured at all.
 - **App capture fails on start:** per-process capture needs Windows 10 version 2004 or newer. Older builds only support `audio.device`.
 - **Light is not responding:** check `host` / `ip` and that your computer can reach it. A device that cannot be reached at startup aborts the program with the underlying error.
 - **Latency:** lower `output.change_interval_ms`, or lower `audio.hop_size` for more frequent analysis.

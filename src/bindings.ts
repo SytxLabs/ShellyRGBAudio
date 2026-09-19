@@ -1,0 +1,50 @@
+export type { AppConfig } from "./types/AppConfig";
+export type { AppGroup } from "./types/AppGroup";
+export type { AppInfo } from "./types/AppInfo";
+export type { AppMatchMode } from "./types/AppMatchMode";
+export type { AppsSection } from "./types/AppsSection";
+export type { AudioDeviceInfo } from "./types/AudioDeviceInfo";
+export type { AudioDeviceSelector } from "./types/AudioDeviceSelector";
+export type { AudioSection } from "./types/AudioSection";
+export type { BandConfig } from "./types/BandConfig";
+export type { ColorMapConfig } from "./types/ColorMapConfig";
+export type { ColorStop } from "./types/ColorStop";
+export type { DeviceForm } from "./types/DeviceForm";
+export type { DeviceSpatialConfig } from "./types/DeviceSpatialConfig";
+export type { DeviceTypeInfo } from "./types/DeviceTypeInfo";
+export type { Downmix } from "./types/Downmix";
+export type { DynamicsSection } from "./types/DynamicsSection";
+export type { EngineState } from "./types/EngineState";
+export type { EngineStatus } from "./types/EngineStatus";
+export type { Interpolation } from "./types/Interpolation";
+export type { LayoutSelector } from "./types/LayoutSelector";
+export type { LevelSource } from "./types/LevelSource";
+export type { LogLevel } from "./types/LogLevel";
+export type { Normalize } from "./types/Normalize";
+export type { OutputSection } from "./types/OutputSection";
+export type { RoomBounds } from "./types/RoomBounds";
+export type { Scale } from "./types/Scale";
+export type { SpatialSection } from "./types/SpatialSection";
+export type { SpeakerPlacement } from "./types/SpeakerPlacement";
+export type { SpeakerRole } from "./types/SpeakerRole";
+export type { WhiteChannel } from "./types/WhiteChannel";
+export type { WindowKind } from "./types/WindowKind";
+
+export type HueLightInfo = { id: string; name: string; };
+export type DeviceEntry = Record<string, unknown> & { type?: string };
+export type Theme = "system" | "light" | "dark";
+export type LanguageSetting = "system" | "en" | "de";
+export type AppPrefs = { config_path: string | null; theme: Theme; language: LanguageSetting; };
+export type LogLine = { level: LogLevel; message: string; };
+export type AppError = { kind: "config" | "engine" | "device" | "io"; message: string; };
+
+export type ConfigPayload = {
+  path: string;
+  config: AppConfig;
+  warnings: string[];
+  recovered: { backup: string | null; error: string } | null;
+  missing: boolean;
+};
+
+import type { LogLevel } from "./types/LogLevel";
+import type { AppConfig } from "./types/AppConfig";
